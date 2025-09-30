@@ -1,0 +1,682 @@
+---
+title: "CellChat Analysis of lt hNPCs"
+author: "Sebastian Schmidt"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  rmarkdown::html_document:
+    theme: cosmo
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: TRUE
+---
+
+
+```{r, include=FALSE}
+#Set knitr and load libraries
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+knitr::opts_knit$set(root.dir = "D:/data/hp_NPCs")
+```
+
+
+```{r setup}
+
+# ---- 1. Setup: Load Libraries and Define Parameters ----
+
+
+
+# Load Libraries
+library(CellChat)
+library(Seurat)
+library(anndata)
+library(SeuratDisk) # For AnnData conversion
+library(patchwork)
+library(ggplot2)
+library(dplyr)
+library(NMF)
+library(ggalluvial)
+library(reticulate) # May be needed for anndata backend
+library(svglite) 
+library(circlize)
+
+# Define Input File and Parameters
+data_file <- "D:/data/hp_NPCs/processed_data/hp_NPC_clustered_scvi_cuda_soup.h5ad"
+output_dir <- "D:/data/hp_NPCs/CellChat" # Main output directory
+
+# Metadata and Data Layer Information
+cell_type_column <- "cell_types"        # Column in adata$obs with cell type labels
+condition_column <- "condition"         # Column in adata$obs specifying 'Control' or 'Parkinson'
+
+# Species Database
+species_db <- "human" # Options: "human" or "mouse"
+
+# Create output directories if they don't exist
+output_plot_dir <- file.path(output_dir, "figures")
+output_object_dir <- file.path(output_dir, "objects")
+output_table_dir <- file.path(output_dir, "table")
+if (!dir.exists(output_plot_dir)) { dir.create(output_plot_dir, recursive = TRUE) }
+if (!dir.exists(output_object_dir)) { dir.create(output_object_dir, recursive = TRUE) }
+if (!dir.exists(output_table_dir)) { dir.create(output_table_dir, recursive = TRUE) }
+
+cat("Output will be saved to:", output_dir, "\n")
+cat("Using cell type labels from:", cell_type_column, "\n")
+cat("Using condition labels from:", condition_column, "\n")
+cat("Using species database:", species_db, "\n")
+
+# Set CellChat options
+options(future.globals.maxSize = 4000 * 1024^2) # Increase limit for parallel processing if needed
+```
+
+
+
+# CellChat for conditions
+## Create CellChat objects
+```{r}
+# read the data into R using anndata R package
+#install.packages("anndata")
+
+ad <- read_h5ad(data_file)
+
+```
+
+
+```{r}
+ad_sub <- ad[ad$obs$condition == "Control", ]
+# access count data matrix
+data.input <- t(as.matrix(ad_sub$layers["scran_normalization"]))
+# normalize the count data if the normalized data is not available in the .h5ad file
+
+data.input <- as(data.input, "dgCMatrix")
+# access meta data
+meta <- ad_sub$obs 
+meta$labels <- meta[["cell_types"]] 
+names(meta)[names(meta) == "Donor"] <- "samples"
+
+chat_ctrl <- createCellChat(object = data.input, meta = meta, group.by = "labels")
+```
+
+```{r}
+ad_sub <- ad[ad$obs$condition == "Parkinson", ]
+# access count data matrix
+data.input <- t(as.matrix(ad_sub$layers["scran_normalization"]))
+# normalize the count data if the normalized data is not available in the .h5ad file
+
+data.input <- as(data.input, "dgCMatrix")
+# access meta data
+meta <- ad_sub$obs 
+meta$labels <- meta[["cell_types"]] 
+names(meta)[names(meta) == "Donor"] <- "samples"
+
+chat_pd <- createCellChat(object = data.input, meta = meta, group.by = "labels")
+```
+
+
+
+```{r}
+
+rm(ad, ad_sub, data.input, meta)
+
+```
+
+
+```{r}
+
+cellchat_list <- list()
+
+# --- Process Control Object ---
+
+if (tolower(species_db) == "human") {
+    CellChatDB_use <- CellChatDB.human 
+} else if (tolower(species_db) == "mouse") {
+    CellChatDB_use <- CellChatDB.mouse
+} else {
+    stop("Unsupported species database specified. Use 'human' or 'mouse'.")
+}
+chat_ctrl@DB <- CellChatDB_use
+
+chat_ctrl <- subsetData(chat_ctrl)
+future::plan("multisession", workers = 10) # Optional for parallelization
+chat_ctrl <- identifyOverExpressedGenes(chat_ctrl)
+chat_ctrl <- identifyOverExpressedInteractions(chat_ctrl)
+
+chat_ctrl <- computeCommunProb(chat_ctrl, type = "truncatedMean", trim = 0.1)
+chat_ctrl <- filterCommunication(chat_ctrl, min.cells = 10)
+chat_ctrl <- computeCommunProbPathway(chat_ctrl)
+chat_ctrl <- aggregateNet(chat_ctrl)
+cellchat_list[["Control"]] <- chat_ctrl
+
+
+# --- Process Parkinson Object ---
+
+chat_pd@DB <- CellChatDB_use # Same database
+
+chat_pd <- subsetData(chat_pd)
+
+chat_pd <- identifyOverExpressedGenes(chat_pd)
+chat_pd <- identifyOverExpressedInteractions(chat_pd)
+
+chat_pd <- computeCommunProb(chat_pd, type = "truncatedMean", trim = 0.1)
+chat_pd <- filterCommunication(chat_pd, min.cells = 10)
+chat_pd <- computeCommunProbPathway(chat_pd)
+chat_pd <- aggregateNet(chat_pd)
+cellchat_list[["Parkinson"]] <- chat_pd
+
+
+# Clean up individual objects if no longer needed directly
+rm(chat_ctrl, chat_pd)
+gc()
+
+
+
+saveRDS(cellchat_list, file = file.path(output_object_dir, "cellchat_list_individual_conditions_processed.rds"))
+#cellchat_list <- readRDS(file = file.path(output_object_dir, "cellchat_list_individual_conditions_processed.rds"))
+```
+
+
+## Visualize overall communication
+```{r, warning=FALSE}
+
+
+for (condition_name in names(cellchat_list)) {
+  condition_plot_dir <- file.path(output_plot_dir, condition_name)
+  if (!dir.exists(condition_plot_dir)) { 
+    dir.create(condition_plot_dir, recursive = TRUE) 
+  }
+  
+  current_cellchat_obj <- cellchat_list[[condition_name]]
+  groupSize <- as.numeric(table(current_cellchat_obj@idents))
+  
+  svg_filename <- file.path(condition_plot_dir, paste0(condition_name, "_NetCircle_SideBySide_Overview.svg"))
+  
+  svglite::svglite(file = svg_filename, width = 12, height = 6) # width/height in inches
+
+  original_par <- par(no.readonly = TRUE) 
+  par(mfrow = c(1,2), xpd = TRUE, mar = c(1, 1, 3, 1)) 
+
+  netVisual_circle(
+    current_cellchat_obj@net$count, 
+    vertex.weight = groupSize, 
+    weight.scale = TRUE, 
+    label.edge = FALSE, 
+    title.name = paste("Interactions (Count) -", condition_name)
+  )
+  
+  netVisual_circle(
+    current_cellchat_obj@net$weight, 
+    vertex.weight = groupSize, 
+    weight.scale = TRUE, 
+    label.edge = FALSE, 
+    title.name = paste("Interactions (Strength) -", condition_name)
+  )
+  
+  par(original_par)
+  dev.off()
+}  
+
+for (condition_name in names(cellchat_list)) {
+  condition_plot_dir <- file.path(output_plot_dir, condition_name)
+  par(mfrow = c(1,2), xpd = TRUE, mar = c(1, 1, 3, 1)) 
+  
+  netVisual_circle(
+    current_cellchat_obj@net$count, 
+    vertex.weight = groupSize, 
+    weight.scale = TRUE, 
+    label.edge = FALSE, 
+    title.name = paste("Interactions (Count) -", condition_name)
+  )
+  netVisual_circle(
+    current_cellchat_obj@net$weight, 
+    vertex.weight = groupSize, 
+    weight.scale = TRUE, 
+    label.edge = FALSE, 
+    title.name = paste("Interactions (Strength) -", condition_name)
+  )
+  par(original_par) # Reset par for this display context
+}
+
+
+
+```
+
+
+
+```{r, message=FALSE,  warnings= FALSE}
+
+for (condition_name in names(cellchat_list)) {
+  cellchat <- cellchat_list[[condition_name]]
+  condition_plot_dir <- file.path(output_plot_dir, condition_name)
+
+  mat <- cellchat@net$weight
+  par(mfrow = c(1,2), xpd = TRUE, mar = c(1, 1, 3, 1)) 
+  for (i in 1:nrow(mat)) {
+    svg_filename <- file.path(condition_plot_dir, paste0(condition_name, "_NetCircle_SideBySide_all", i ,".svg"))
+  
+    svglite::svglite(file = svg_filename, width = 12, height = 6) # width/height in inches
+  
+    mat2 <- matrix(0, nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))
+    mat2[i, ] <- mat[i, ]
+    netVisual_circle(mat2, vertex.weight = groupSize, weight.scale = T, edge.weight.max = max(mat), title.name = rownames(mat)[i])
+    dev.off()
+
+  }
+}
+
+for (condition_name in names(cellchat_list)) {
+  cellchat <- cellchat_list[[condition_name]]
+  condition_plot_dir <- file.path(output_plot_dir, condition_name)
+
+  mat <- cellchat@net$weight
+  par(mfrow = c(1,2), xpd = TRUE, mar = c(1, 1, 3, 1)) 
+  for (i in 1:nrow(mat)) {
+    
+    mat2 <- matrix(0, nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))
+    mat2[i, ] <- mat[i, ]
+    netVisual_circle(mat2, vertex.weight = groupSize, weight.scale = T, edge.weight.max = max(mat), title.name = rownames(mat)[i])
+
+  }
+}
+
+```
+
+
+
+
+
+```{r}
+# Signaling role analysis on the aggregated cell-cell communication network from all signaling pathways
+
+for (condition_name in names(cellchat_list)) {
+  cellchat <- cellchat_list[[condition_name]]
+  condition_plot_dir <- file.path(output_plot_dir, condition_name)
+
+  cellchat <- netAnalysis_computeCentrality(cellchat, slot.name = "netP")
+  cellchat_list[[condition_name]] <- cellchat
+  par(mfrow = c(1,2), xpd = TRUE, mar = c(1, 1, 3, 1)) 
+
+  ht1 <- netAnalysis_signalingRole_heatmap(cellchat, pattern = "outgoing")
+  ht2 <- netAnalysis_signalingRole_heatmap(cellchat, pattern = "incoming")
+  
+  svg_filename <- file.path(condition_plot_dir, paste0(condition_name, "_heatmap_signaling_pathways_outgoing.svg"))
+  svglite(file = svg_filename, width = 8, height = 15) 
+  ComplexHeatmap::draw(ht1, annotation_legend_side = "bottom")
+  dev.off()
+  
+  svg_filename <- file.path(condition_plot_dir, paste0(condition_name, "_heatmap_signaling_pathways_incoming.svg"))
+  svglite(file = svg_filename, width = 8, height = 15) 
+  ComplexHeatmap::draw(ht2, annotation_legend_side = "bottom")
+  dev.off()
+  
+}
+
+```
+
+## Visualize interesting signaling pathways
+
+```{r, echo = FALSE, warnings=FALSE}
+df_ctrl <- subsetCommunication(cellchat_list[['Control']])
+df_pd <- subsetCommunication(cellchat_list[['Parkinson']])
+
+
+table_dir <- file.path(output_table_dir, 'Control')
+if (!dir.exists(table_dir)) { dir.create(table_dir, recursive = TRUE) }
+path = file.path(table_dir, "Control_communication_pathways_overview.csv")
+write.csv(df_ctrl, file = path, quote=FALSE, row.names = FALSE)
+
+table_dir <- file.path(output_table_dir, 'Parkinson')
+if (!dir.exists(table_dir)) { dir.create(table_dir, recursive = TRUE) }
+path = file.path(table_dir, "Parkinson_communication_pathways_overview.csv")
+write.csv(df_pd, file = path, quote=FALSE, row.names = FALSE)
+
+```
+
+
+```{r}
+pathways = c("HH", "WNT", "TGFb", "NOTCH", "CXCL", "Glutamate", "Dopamine")
+```
+
+
+```{r}
+for (condition_name in names(cellchat_list)) {
+  cellchat <- cellchat_list[[condition_name]]
+  condition_plot_dir <- file.path(output_plot_dir, condition_name)
+  for (p in pathways) {
+    filename = file.path(condition_plot_dir, paste0(condition_name, "_chord_pathway_",p,".svg"))
+    svg(filename, width = 10, height = 10) # Or png()
+    circos.clear()
+    circos.par(gap.degree = 5) 
+    netVisual_aggregate(cellchat, signaling = p, layout = "chord", vertex.label.cex = 0.7)
+    circos.clear()
+    dev.off()
+  }
+}
+```
+
+
+```{r}
+for (condition_name in names(cellchat_list)) {
+  cellchat <- cellchat_list[[condition_name]]
+  condition_plot_dir <- file.path(output_plot_dir, condition_name)
+  for (p in pathways) {
+    filename = file.path(condition_plot_dir, paste0(condition_name, "_network_pathway_",p,".svg"))
+    svg(filename, width = 10, height = 10) 
+    netVisual_aggregate(cellchat, signaling = p, layout = "circle")
+    dev.off()
+  }
+}
+```
+
+
+```{r}
+for (condition_name in names(cellchat_list)) {
+  cellchat <- cellchat_list[[condition_name]]
+  condition_plot_dir <- file.path(output_plot_dir, condition_name)
+  for (p in pathways) {
+    filename = file.path(condition_plot_dir, paste0(condition_name, "_contributions_pathway_",p,".svg"))
+
+    cont = netAnalysis_contribution(cellchat, signaling = p)
+    ggsave(filename, plot=cont)
+  }
+}
+```
+
+
+```{r}
+for (condition_name in names(cellchat_list)) {
+  cellchat <- cellchat_list[[condition_name]]
+  condition_plot_dir <- file.path(output_plot_dir, condition_name)
+  for (p in pathways) {
+    filename = file.path(condition_plot_dir, paste0(condition_name, "_expression_levels_pathway_",p,".svg"))
+
+    cont = plotGeneExpression(cellchat, signaling = p, enriched.only = TRUE, type = "violin")
+    ggsave(filename, plot=cont)
+  }
+}
+```
+
+
+## Identify Communication patterns (outgoing)
+```{r}
+library(NMF)
+library(ggalluvial)
+
+selectK(cellchat_list[['Control']], pattern = "outgoing")
+```
+
+
+```{r}
+
+selectK(cellchat_list[['Parkinson']], pattern = "outgoing")
+```
+
+```{r}
+nPatterns = 7
+
+```
+
+
+```{r, warning=FALSE, fig.width=10}
+cellchat <- cellchat_list[['Control']]
+
+cellchat <- identifyCommunicationPatterns(cellchat, pattern = "outgoing", k = nPatterns)
+cellchat_list[['Control']] <- cellchat
+
+
+
+```
+
+
+```{r, warning=FALSE, fig.width=10}
+cellchat <- cellchat_list[['Parkinson']]
+
+cellchat <- identifyCommunicationPatterns(cellchat, pattern = "outgoing", k = nPatterns)
+cellchat_list[['Parkinson']] <- cellchat
+
+
+
+```
+
+
+```{r}
+
+for (condition_name in names(cellchat_list)) {
+  cellchat <- cellchat_list[[condition_name]]
+  condition_plot_dir <- file.path(output_plot_dir, condition_name)
+  
+  filename = file.path(condition_plot_dir, paste0(condition_name, "_pattern_outgoing_river.svg"))
+  p = netAnalysis_river(cellchat, pattern = "outgoing")
+  ggsave(filename, plot = p, width = 10, height = 10, device = "svg")
+
+}
+
+
+```
+
+```{r}
+
+for (condition_name in names(cellchat_list)) {
+  cellchat <- cellchat_list[[condition_name]]
+  condition_plot_dir <- file.path(output_plot_dir, condition_name)
+  
+  filename = file.path(condition_plot_dir, paste0(condition_name, "_pattern_outgoing_dot.svg"))
+  p = netAnalysis_dot(cellchat, pattern = "outgoing")
+  ggsave(filename, plot = p, width = 12, height = 5, device = "svg")
+
+}
+
+
+```
+
+
+
+## Identify Communication patterns (incoming)
+```{r}
+library(NMF)
+library(ggalluvial)
+
+selectK(cellchat_list[['Control']], pattern = "incoming")
+```
+
+
+```{r}
+
+selectK(cellchat_list[['Parkinson']], pattern = "incoming")
+```
+
+```{r}
+nPatterns = 6
+
+```
+
+
+```{r, warning=FALSE, fig.width=10}
+cellchat <- cellchat_list[['Control']]
+
+cellchat <- identifyCommunicationPatterns(cellchat, pattern = "incoming", k = nPatterns)
+cellchat_list[['Control']] <- cellchat
+
+
+
+```
+
+
+```{r, warning=FALSE, fig.width=10}
+cellchat <- cellchat_list[['Parkinson']]
+
+cellchat <- identifyCommunicationPatterns(cellchat, pattern = "incoming", k = nPatterns)
+cellchat_list[['Parkinson']] <- cellchat
+
+
+
+```
+
+
+```{r}
+
+for (condition_name in names(cellchat_list)) {
+  cellchat <- cellchat_list[[condition_name]]
+  condition_plot_dir <- file.path(output_plot_dir, condition_name)
+  
+  filename = file.path(condition_plot_dir, paste0(condition_name, "_pattern_incoming_river.svg"))
+  p = netAnalysis_river(cellchat, pattern = "incoming")
+  ggsave(filename, plot = p, width = 10, height = 10, device = "svg")
+
+}
+
+
+```
+
+```{r}
+
+for (condition_name in names(cellchat_list)) {
+  cellchat <- cellchat_list[[condition_name]]
+  condition_plot_dir <- file.path(output_plot_dir, condition_name)
+  
+  filename = file.path(condition_plot_dir, paste0(condition_name, "_pattern_incoming_dot.svg"))
+  p = netAnalysis_dot(cellchat, pattern = "incoming")
+  ggsave(filename, plot = p, width = 12, height = 5, device = "svg")
+
+}
+
+
+```
+
+```{r}
+saveRDS(cellchat_list, file = file.path(output_object_dir, "cellchat_list_individual_conditions_processed_beforemerge.rds"))
+#cellchat_list <- readRDS(file = file.path(output_object_dir, "cellchat_list_individual_conditions_processed_beforemerge.rds"))
+```
+
+
+# Differential signaling
+
+```{r}
+# ---- 7. Merge CellChat Objects for Comparison ----
+cellchat <- mergeCellChat(cellchat_list, add.names = names(cellchat_list), cell.prefix = TRUE) 
+
+saveRDS(cellchat, file = file.path(output_object_dir, "cellchat_comparison.rds"))
+
+# Create a subdirectory for comparison plots
+comparison_plot_dir <- file.path(output_plot_dir, "Comparison")
+if (!dir.exists(comparison_plot_dir)) { dir.create(comparison_plot_dir) }
+comparison_table_dir <- file.path(output_table_dir, "Comparison")
+if (!dir.exists(comparison_table_dir)) { dir.create(comparison_table_dir) }
+```
+```{r}
+saveRDS(cellchat, file = file.path(output_object_dir, "cellchat_merge.rds"))
+#cellchat <- readRDS(file = file.path(output_object_dir, "cellchat_merge.rds"))
+```
+
+```{r}
+# ---- 8. Compare Interaction Numbers & Strength (Bar Plots) ----
+
+gg1 <- compareInteractions(cellchat, show.legend = FALSE, group = c(1,2), measure = "count") + 
+       ggtitle("Total Interaction Count")+ylim(0, 10000)
+gg2 <- compareInteractions(cellchat, show.legend = FALSE, group = c(1,2), measure = "weight") + 
+       ggtitle("Total Interaction Strength")+ylim(0, 110)
+
+p <- gg1 + gg2
+print(p)
+ggsave(file.path(comparison_plot_dir, "Compare_TotalInteractions_Strength_Bar.svg"), 
+       plot = p, width = 8, height = 4, dpi = 300)
+```
+
+
+```{r}
+svg_filename <- file.path(comparison_plot_dir, paste0("Compare_NetCircle_Count_Overview.svg"))
+svglite::svglite(file = svg_filename, width = 12, height = 6) # width/height in inches
+
+par(mfrow = c(1,2), xpd = TRUE, mar = c(1, 1, 3, 1)) 
+netVisual_diffInteraction(cellchat, weight.scale = T)
+
+
+dev.off()
+
+svg_filename <- file.path(comparison_plot_dir, paste0("Compare_NetCircle_Strength_Overview.svg"))
+svglite::svglite(file = svg_filename, width = 12, height = 6) # width/height in inches
+
+par(mfrow = c(1,2), xpd = TRUE, mar = c(1, 1, 3, 1)) 
+netVisual_diffInteraction(cellchat, weight.scale = T, measure = "weight")
+
+dev.off()
+```
+
+```{r}
+gg1 <- netVisual_heatmap(cellchat)
+
+gg2 <- netVisual_heatmap(cellchat, measure = "weight")
+
+gg1 + gg2
+
+svg_filename <- file.path(comparison_plot_dir, paste0("Compare_heatmap_Overview.svg"))
+svglite(file = svg_filename, width = 8, height = 4) 
+ComplexHeatmap::draw(gg1+gg2, annotation_legend_side = "bottom")
+dev.off()
+```
+
+```{r}
+
+num.link <- sapply(cellchat_list, function(x) {rowSums(x@net$count) + colSums(x@net$count)-diag(x@net$count)})
+weight.MinMax <- c(min(num.link), max(num.link)) # control the dot size in the different datasets
+gg <- list()
+for (i in 1:length(cellchat_list)) {
+  gg[[i]] <- netAnalysis_signalingRole_scatter(cellchat_list[[i]], title = names(cellchat_list)[i], weight.MinMax = weight.MinMax)
+}
+#> Signaling role analysis on the aggregated cell-cell communication network from all signaling pathways
+#> Signaling role analysis on the aggregated cell-cell communication network from all signaling pathways
+
+svg_filename <- file.path(comparison_plot_dir, paste0("Compare_incoming-outgoing_Overview.svg"))
+svglite(file = svg_filename, width = 10, height = 4) 
+patchwork::wrap_plots(plots = gg)
+```
+
+```{r}
+rankNet_comparison_data <- rankNet(cellchat, 
+                                   mode = "comparison", 
+                                   stacked = FALSE)
+
+# The data frame is in the 'data' slot of the returned list
+differential_pathways_df <- rankNet_comparison_data$data
+
+
+pathway_comparison_filename <- file.path(comparison_table_dir, paste0("Compare_differential_signaling.svg"))
+write.csv(differential_pathways_df, file = pathway_comparison_filename, row.names = FALSE)
+```
+
+```{r}
+gg1 <- rankNet(cellchat, mode = "comparison", measure = "weight", sources.use = NULL, targets.use = NULL, stacked = T, do.stat = TRUE)
+gg2 <- rankNet(cellchat, mode = "comparison", measure = "weight", sources.use = NULL, targets.use = NULL, stacked = F, do.stat = TRUE)
+
+gg1 + gg2
+filename <- file.path(comparison_plot_dir, paste0("Compare_differential_signaling_pathways_bars.svg"))
+ggsave(filename, plot = (gg1+gg2), width = 10, height = 10)
+```
+
+
+
+
+
+```{r}
+
+
+
+for (p in pathways) {
+  filename = file.path(comparison_plot_dir, paste0("Compare_expression_levels_pathway_",p,".svg"))
+
+  cont = plotGeneExpression(cellchat, signaling = p, split.by = "datasets", colors.ggplot = T, type = "violin")
+  ggsave(filename, plot=cont)
+}
+
+
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
