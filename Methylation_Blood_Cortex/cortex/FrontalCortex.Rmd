@@ -1,0 +1,535 @@
+---
+title: "Methylation data - frontal cortex"
+author: "Sebastian Schmidt"
+date: "2025-06-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+knitr::opts_knit$set(root.dir = "F:/MetaAnalysisMethylation")
+
+library(BiocParallel)
+library(ggplot2)
+library(dplyr)
+library(parallel)
+library(data.table)
+library(tibble)
+library(missMethyl)
+library(msigdbr)
+library(clusterProfiler)
+library(enrichplot)
+library(DOSE)
+library(meta)
+library(fdrtool)
+library(ggrastr)
+library(ggrepel)
+library(tidyr)
+library(stringr)
+library(ggnewscale)
+library(fuzzyjoin)
+library(bacon)
+```
+
+```{r}
+sampleSet <- 'GSE203332'
+
+baseDir <- "F:/MetaAnalysisMethylation"
+outputDir <- file.path(baseDir, "output")
+tableDir <- file.path(outputDir, "tables")
+plotDir <- file.path(outputDir, "figures")
+```
+
+
+```{r}
+inputDir <- file.path(baseDir, "input")
+dir.create(tableDir, showWarnings = FALSE, recursive = TRUE)
+dir.create(plotDir, showWarnings = FALSE, recursive = TRUE)
+```
+
+
+# Ctrl vs Combined (PD+PDD)
+```{r}
+
+summary_filepath <- file.path(tableDir, paste0(sampleSet, "_results_Ctrl_CombinedPD-PDD_with_2SVs.csv"))
+results <- fread(summary_filepath) %>% as.data.frame()
+
+ 
+```
+```{r}
+head(results)
+```
+
+## Miami Plot
+
+```{r}
+# Miami plot
+
+
+chr_bounds <- results %>%
+  filter(!is.na(chr) & !is.na(start)) %>%
+  mutate(CHR_numeric = case_when(
+    toupper(chr) == "chrX" ~ 23, toupper(chr) == "chrY" ~ 24,
+    TRUE ~ as.integer(stringr::str_remove(chr, "chr"))
+  )) %>%
+  filter(!is.na(CHR_numeric)) %>%
+  group_by(CHR_numeric) %>%
+  summarise(max_bp = max(start, na.rm = TRUE), .groups = "drop") %>%
+  mutate(bp_add = lag(cumsum(as.numeric(max_bp)), default = 0))
+
+
+plot_data <- results %>%
+  mutate(CHR_numeric = case_when(
+      toupper(chr) == "chrX" ~ 23, toupper(chr) == "chrY" ~ 24,
+      TRUE ~ as.integer(stringr::str_remove(chr, "chr")))) %>%
+  inner_join(chr_bounds, by = "CHR_numeric") %>% 
+  mutate(
+    bp_cumulative = start + bp_add, 
+    y_position = -log10(adj.P.Val) * sign(effect_size)
+  )
+
+label_data <- plot_data %>%
+  filter(adj.P.Val < 0.05 & !is.na(genesUniq))
+
+fdr_line_y_intercept <- -log10(max(plot_data$adj.P.Val[plot_data$adj.P.Val < 0.05], na.rm = TRUE))
+axis_labels <- plot_data %>% group_by(CHR_numeric) %>% summarize(center = mean(bp_cumulative), .groups = "drop")
+
+
+miami_plot <- ggplot(plot_data, aes(x = bp_cumulative, y = y_position, color = effect_size > 0)) +
+  geom_point_rast(aes(color = as.factor(CHR_numeric %% 2)), 
+                  alpha = 0.7, size = 1, show.legend = FALSE, 
+                  raster.dpi = 600) +
+  scale_color_manual(values = c("0" = "skyblue", "1" = "grey60")) + 
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.5) +
+  geom_hline(yintercept = c(fdr_line_y_intercept, -fdr_line_y_intercept), color = "black", linetype = "dashed") +
+  scale_x_continuous(label = axis_labels$CHR_numeric, breaks = axis_labels$center) +
+  scale_y_continuous(labels = abs) +
+  labs(x = "Chromosome", y = "-log10(p-value)") +
+  geom_text_repel(
+    data = label_data,
+    aes(label = genesUniq),
+    size = 3.5,                     
+    color = "black",                
+    box.padding = 0.5,              
+    point.padding = 0.3,            
+    max.overlaps = 20,             
+    min.segment.length = 0,         
+    segment.color = 'grey50',       
+    segment.size = 0.3              
+  ) +
+  theme_classic() +
+  theme(panel.grid.major.x = element_blank())
+
+print(miami_plot)
+ggsave(filename=file.path(plotDir, "FrontalCortex_Combined_Miami.svg"), device="svg",width = 14, height = 7, units = "cm")
+```
+
+## Pathway enrichment analysis
+
+```{r}
+sig_probes <- results$Probe_ID[results$adj.P.Val < 0.05]
+all_probes <- results$Probe_ID
+```
+
+```{r}
+# Gene Ontology
+gos <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "GO:BP")
+gos_bp <- split(x = gos$entrez_gene, f = gos$gs_name)
+
+gos <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "GO:CC")
+gos_cc <- split(x = gos$entrez_gene, f = gos$gs_name)
+
+gos <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "GO:MF")
+gos_mf <- split(x = gos$entrez_gene, f = gos$gs_name)
+
+# KEGG Legacy
+keggs_legacy <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG_LEGACY")
+keggs_legacy <- split(x = keggs_legacy$entrez_gene, f = keggs_legacy$gs_name)
+
+# KEGG Medicus
+keggs_med <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG_MEDICUS")
+keggs_med <- split(x = keggs_med$entrez_gene, f = keggs_med$gs_name)
+
+# Reactome
+reactomes <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:REACTOME")
+reactomes <- split(x = reactomes$entrez_gene, f = reactomes$gs_name)
+
+# WikiPathways
+wikipathways <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:WIKIPATHWAYS")
+wikipathways <- split(x = wikipathways$entrez_gene, f = wikipathways$gs_name)
+```
+
+
+```{r}
+# Run Enrichment Analysis using gsameth() 
+
+eGO_bp <- gsameth(
+  sig.cpg = sig_probes,
+  all.cpg = all_probes,
+  collection = gos_bp,
+  array.type = "EPIC",
+  plot.bias = FALSE,
+  prior.prob = TRUE
+)
+eGO_bp <- eGO_bp[order(eGO_bp$FDR), ]
+cat("Found", length(eGO_bp[eGO_bp$FDR<0.05,]$FDR), "enriched GO BP terms.\n")
+write.csv(eGO_bp, file.path(tableDir, "FrontalCortex_Combined_Enrichment_GObp.csv"))
+
+eGO_cc <- gsameth(
+  sig.cpg = sig_probes,
+  all.cpg = all_probes,
+  collection = gos_cc,
+  array.type = "EPIC",
+  plot.bias = FALSE,
+  prior.prob = TRUE
+)
+eGO_cc <- eGO_cc[order(eGO_cc$FDR), ]
+cat("Found", length(eGO_cc[eGO_cc$FDR<0.05,]$FDR), "enriched GO CC terms.\n")
+write.csv(eGO_cc, file.path(tableDir, "FrontalCortex_Combined_Enrichment_GOcc.csv"))
+
+eGO_mf <- gsameth(
+  sig.cpg = sig_probes,
+  all.cpg = all_probes,
+  collection = gos_mf,
+  array.type = "EPIC",
+  plot.bias = FALSE,
+  prior.prob = TRUE
+)
+eGO_mf <- eGO_mf[order(eGO_mf$FDR), ]
+cat("Found", length(eGO_mf[eGO_mf$FDR<0.05,]$FDR), "enriched GO MF terms.\n")
+write.csv(eGO_mf, file.path(tableDir, "FrontalCortex_Combined_Enrichment_GOmf.csv"))
+
+eReactome <- gsameth(
+  sig.cpg = sig_probes,
+  all.cpg = all_probes,
+  collection = reactomes,
+  array.type = "EPIC",
+  plot.bias = FALSE,
+  prior.prob = TRUE
+)
+eReactome <- eReactome[order(eReactome$FDR), ]
+cat("Found", length(eReactome[eReactome$FDR<0.05,]$FDR), "enriched Reactome terms.\n")
+write.csv(eReactome, file.path(tableDir, "FrontalCortex_Combined_Enrichment_Reactome.csv"))
+
+eKEGG_legacy <- gsameth(
+  sig.cpg = sig_probes,
+  all.cpg = all_probes,
+  collection = keggs_legacy,
+  array.type = "EPIC",
+  plot.bias = FALSE,
+  prior.prob = TRUE
+)
+eKEGG_legacy <- eKEGG_legacy[order(eKEGG_legacy$FDR), ]
+cat("Found", length(eKEGG_legacy[eKEGG_legacy$FDR<0.05,]$FDR), "enriched KEGG_legacy terms.\n")
+write.csv(eKEGG_legacy, file.path(tableDir, "FrontalCortex_Combined_Enrichment_KEGG_legacy.csv"))
+
+eKEGG_med <- gsameth(
+  sig.cpg = sig_probes,
+  all.cpg = all_probes,
+  collection = keggs_med,
+  array.type = "EPIC",
+  plot.bias = FALSE,
+  prior.prob = TRUE
+)
+eKEGG_med <- eKEGG_med[order(eKEGG_med$FDR), ]
+cat("Found", length(eKEGG_med[eKEGG_med$FDR<0.05,]$FDR), "enriched KEGG_med terms.\n")
+write.csv(eKEGG_med, file.path(tableDir, "FrontalCortex_Combined_Enrichment_KEGG_med.csv"))
+
+eWP <- gsameth(
+  sig.cpg = sig_probes,
+  all.cpg = all_probes,
+  collection = wikipathways,
+  array.type = "EPIC",
+  plot.bias = FALSE,
+  prior.prob = TRUE
+)
+eWP <- eWP[order(eWP$FDR), ]
+cat("Found", length(eWP[eWP$FDR<0.05,]$FDR), "enriched WP terms.\n")
+write.csv(eWP, file.path(tableDir, "FrontalCortex_Combined_Enrichment_WP.csv"))
+
+
+```
+
+
+# Ctrl vs PD
+```{r}
+
+summary_filepath <- file.path(tableDir, paste0(sampleSet, "_results_Ctrl_PD_with_0SVs.csv"))
+results <- fread(summary_filepath) %>% as.data.frame()
+
+ 
+```
+```{r}
+head(results)
+```
+
+## Miami Plot
+
+```{r}
+# Miami plot
+
+
+chr_bounds <- results %>%
+  filter(!is.na(chr) & !is.na(start)) %>%
+  mutate(CHR_numeric = case_when(
+    toupper(chr) == "chrX" ~ 23, toupper(chr) == "chrY" ~ 24,
+    TRUE ~ as.integer(stringr::str_remove(chr, "chr"))
+  )) %>%
+  filter(!is.na(CHR_numeric)) %>%
+  group_by(CHR_numeric) %>%
+  summarise(max_bp = max(start, na.rm = TRUE), .groups = "drop") %>%
+  mutate(bp_add = lag(cumsum(as.numeric(max_bp)), default = 0))
+
+
+plot_data <- results %>%
+  mutate(CHR_numeric = case_when(
+      toupper(chr) == "chrX" ~ 23, toupper(chr) == "chrY" ~ 24,
+      TRUE ~ as.integer(stringr::str_remove(chr, "chr")))) %>%
+  inner_join(chr_bounds, by = "CHR_numeric") %>% 
+  mutate(
+    bp_cumulative = start + bp_add, 
+    y_position = -log10(adj.P.Val) * sign(effect_size)
+  )
+
+label_data <- plot_data %>%
+  filter(adj.P.Val < 0.05 & !is.na(genesUniq))
+
+fdr_line_y_intercept <- -log10(max(plot_data$adj.P.Val[plot_data$adj.P.Val < 0.05], na.rm = TRUE))
+axis_labels <- plot_data %>% group_by(CHR_numeric) %>% summarize(center = mean(bp_cumulative), .groups = "drop")
+
+
+miami_plot <- ggplot(plot_data, aes(x = bp_cumulative, y = y_position, color = effect_size > 0)) +
+  geom_point_rast(aes(color = as.factor(CHR_numeric %% 2)), 
+                  alpha = 0.7, size = 1, show.legend = FALSE, 
+                  raster.dpi = 600) +
+  scale_color_manual(values = c("0" = "skyblue", "1" = "grey60")) + 
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.5) +
+  geom_hline(yintercept = c(fdr_line_y_intercept, -fdr_line_y_intercept), color = "black", linetype = "dashed") +
+  scale_x_continuous(label = axis_labels$CHR_numeric, breaks = axis_labels$center) +
+  scale_y_continuous(labels = abs) +
+  labs(x = "Chromosome", y = "-log10(p-value)") +
+  geom_text_repel(
+    data = label_data,
+    aes(label = genesUniq),
+    size = 3.5,                     
+    color = "black",                
+    box.padding = 0.5,              
+    point.padding = 0.3,            
+    max.overlaps = 20,             
+    min.segment.length = 0,         
+    segment.color = 'grey50',       
+    segment.size = 0.3              
+  ) +
+  theme_classic() +
+  theme(panel.grid.major.x = element_blank())
+
+print(miami_plot)
+ggsave(filename=file.path(plotDir, "FrontalCortex_PD_Miami.svg"), device="svg",width = 14, height = 7, units = "cm")
+```
+
+## Pathway enrichment analysis
+Not enough DMPs
+
+
+# Ctrl vs PDD
+```{r}
+
+summary_filepath <- file.path(tableDir, paste0(sampleSet, "_results_Ctrl_PDD_with_2SVs.csv"))
+results <- fread(summary_filepath) %>% as.data.frame()
+
+ 
+```
+```{r}
+head(results)
+```
+
+## Miami Plot
+
+```{r}
+# Miami plot
+
+
+chr_bounds <- results %>%
+  filter(!is.na(chr) & !is.na(start)) %>%
+  mutate(CHR_numeric = case_when(
+    toupper(chr) == "chrX" ~ 23, toupper(chr) == "chrY" ~ 24,
+    TRUE ~ as.integer(stringr::str_remove(chr, "chr"))
+  )) %>%
+  filter(!is.na(CHR_numeric)) %>%
+  group_by(CHR_numeric) %>%
+  summarise(max_bp = max(start, na.rm = TRUE), .groups = "drop") %>%
+  mutate(bp_add = lag(cumsum(as.numeric(max_bp)), default = 0))
+
+
+plot_data <- results %>%
+  mutate(CHR_numeric = case_when(
+      toupper(chr) == "chrX" ~ 23, toupper(chr) == "chrY" ~ 24,
+      TRUE ~ as.integer(stringr::str_remove(chr, "chr")))) %>%
+  inner_join(chr_bounds, by = "CHR_numeric") %>% 
+  mutate(
+    bp_cumulative = start + bp_add, 
+    y_position = -log10(adj.P.Val) * sign(effect_size)
+  )
+
+label_data <- plot_data %>%
+  filter(adj.P.Val < 0.05 & !is.na(genesUniq))
+
+fdr_line_y_intercept <- -log10(max(plot_data$adj.P.Val[plot_data$adj.P.Val < 0.05], na.rm = TRUE))
+axis_labels <- plot_data %>% group_by(CHR_numeric) %>% summarize(center = mean(bp_cumulative), .groups = "drop")
+
+
+miami_plot <- ggplot(plot_data, aes(x = bp_cumulative, y = y_position, color = effect_size > 0)) +
+  geom_point_rast(aes(color = as.factor(CHR_numeric %% 2)), 
+                  alpha = 0.7, size = 1, show.legend = FALSE, 
+                  raster.dpi = 600) +
+  scale_color_manual(values = c("0" = "skyblue", "1" = "grey60")) + 
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.5) +
+  geom_hline(yintercept = c(fdr_line_y_intercept, -fdr_line_y_intercept), color = "black", linetype = "dashed") +
+  scale_x_continuous(label = axis_labels$CHR_numeric, breaks = axis_labels$center) +
+  scale_y_continuous(labels = abs) +
+  labs(x = "Chromosome", y = "-log10(p-value)") +
+  geom_text_repel(
+    data = label_data,
+    aes(label = genesUniq),
+    size = 3.5,                     
+    color = "black",                
+    box.padding = 0.5,              
+    point.padding = 0.3,            
+    max.overlaps = 20,             
+    min.segment.length = 0,         
+    segment.color = 'grey50',       
+    segment.size = 0.3              
+  ) +
+  theme_classic() +
+  theme(panel.grid.major.x = element_blank())
+
+print(miami_plot)
+ggsave(filename=file.path(plotDir, "FrontalCortex_PDD_Miami.svg"), device="svg",width = 14, height = 7, units = "cm")
+```
+
+## Pathway enrichment analysis
+
+```{r}
+sig_probes <- results$Probe_ID[results$adj.P.Val < 0.05]
+all_probes <- results$Probe_ID
+```
+
+```{r}
+# Gene Ontology
+gos <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "GO:BP")
+gos_bp <- split(x = gos$entrez_gene, f = gos$gs_name)
+
+gos <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "GO:CC")
+gos_cc <- split(x = gos$entrez_gene, f = gos$gs_name)
+
+gos <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "GO:MF")
+gos_mf <- split(x = gos$entrez_gene, f = gos$gs_name)
+
+# KEGG Legacy
+keggs_legacy <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG_LEGACY")
+keggs_legacy <- split(x = keggs_legacy$entrez_gene, f = keggs_legacy$gs_name)
+
+# KEGG Medicus
+keggs_med <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG_MEDICUS")
+keggs_med <- split(x = keggs_med$entrez_gene, f = keggs_med$gs_name)
+
+# Reactome
+reactomes <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:REACTOME")
+reactomes <- split(x = reactomes$entrez_gene, f = reactomes$gs_name)
+
+# WikiPathways
+wikipathways <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:WIKIPATHWAYS")
+wikipathways <- split(x = wikipathways$entrez_gene, f = wikipathways$gs_name)
+```
+
+
+```{r}
+# Run Enrichment Analysis using gsameth() 
+
+eGO_bp <- gsameth(
+  sig.cpg = sig_probes,
+  all.cpg = all_probes,
+  collection = gos_bp,
+  array.type = "EPIC",
+  plot.bias = FALSE,
+  prior.prob = TRUE
+)
+eGO_bp <- eGO_bp[order(eGO_bp$FDR), ]
+cat("Found", length(eGO_bp[eGO_bp$FDR<0.05,]$FDR), "enriched GO BP terms.\n")
+write.csv(eGO_bp, file.path(tableDir, "FrontalCortex_PDD_Enrichment_GObp.csv"))
+
+eGO_cc <- gsameth(
+  sig.cpg = sig_probes,
+  all.cpg = all_probes,
+  collection = gos_cc,
+  array.type = "EPIC",
+  plot.bias = FALSE,
+  prior.prob = TRUE
+)
+eGO_cc <- eGO_cc[order(eGO_cc$FDR), ]
+cat("Found", length(eGO_cc[eGO_cc$FDR<0.05,]$FDR), "enriched GO CC terms.\n")
+write.csv(eGO_cc, file.path(tableDir, "FrontalCortex_PDD_Enrichment_GOcc.csv"))
+
+eGO_mf <- gsameth(
+  sig.cpg = sig_probes,
+  all.cpg = all_probes,
+  collection = gos_mf,
+  array.type = "EPIC",
+  plot.bias = FALSE,
+  prior.prob = TRUE
+)
+eGO_mf <- eGO_mf[order(eGO_mf$FDR), ]
+cat("Found", length(eGO_mf[eGO_mf$FDR<0.05,]$FDR), "enriched GO MF terms.\n")
+write.csv(eGO_mf, file.path(tableDir, "FrontalCortex_PDD_Enrichment_GOmf.csv"))
+
+eReactome <- gsameth(
+  sig.cpg = sig_probes,
+  all.cpg = all_probes,
+  collection = reactomes,
+  array.type = "EPIC",
+  plot.bias = FALSE,
+  prior.prob = TRUE
+)
+eReactome <- eReactome[order(eReactome$FDR), ]
+cat("Found", length(eReactome[eReactome$FDR<0.05,]$FDR), "enriched Reactome terms.\n")
+write.csv(eReactome, file.path(tableDir, "FrontalCortex_PDD_Enrichment_Reactome.csv"))
+
+eKEGG_legacy <- gsameth(
+  sig.cpg = sig_probes,
+  all.cpg = all_probes,
+  collection = keggs_legacy,
+  array.type = "EPIC",
+  plot.bias = FALSE,
+  prior.prob = TRUE
+)
+eKEGG_legacy <- eKEGG_legacy[order(eKEGG_legacy$FDR), ]
+cat("Found", length(eKEGG_legacy[eKEGG_legacy$FDR<0.05,]$FDR), "enriched KEGG_legacy terms.\n")
+write.csv(eKEGG_legacy, file.path(tableDir, "FrontalCortex_PDD_Enrichment_KEGG_legacy.csv"))
+
+eKEGG_med <- gsameth(
+  sig.cpg = sig_probes,
+  all.cpg = all_probes,
+  collection = keggs_med,
+  array.type = "EPIC",
+  plot.bias = FALSE,
+  prior.prob = TRUE
+)
+eKEGG_med <- eKEGG_med[order(eKEGG_med$FDR), ]
+cat("Found", length(eKEGG_med[eKEGG_med$FDR<0.05,]$FDR), "enriched KEGG_med terms.\n")
+write.csv(eKEGG_med, file.path(tableDir, "FrontalCortex_PDD_Enrichment_KEGG_med.csv"))
+
+eWP <- gsameth(
+  sig.cpg = sig_probes,
+  all.cpg = all_probes,
+  collection = wikipathways,
+  array.type = "EPIC",
+  plot.bias = FALSE,
+  prior.prob = TRUE
+)
+eWP <- eWP[order(eWP$FDR), ]
+cat("Found", length(eWP[eWP$FDR<0.05,]$FDR), "enriched WP terms.\n")
+write.csv(eWP, file.path(tableDir, "FrontalCortex_PDD_Enrichment_WP.csv"))
+
+
+```
+

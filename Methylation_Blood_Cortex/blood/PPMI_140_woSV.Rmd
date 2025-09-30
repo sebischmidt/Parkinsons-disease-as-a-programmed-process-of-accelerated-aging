@@ -1,0 +1,1177 @@
+---
+title: "Processing methylation data - PPMI_140"
+author: "Sebastian Schmidt"
+date: "2025-05-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+knitr::opts_knit$set(root.dir = "F:/MetaAnalysisMethylation")
+
+
+library(minfi)
+library(limma)
+library(SmartSVA)
+library(ggplot2)
+library(IlluminaHumanMethylation450kmanifest)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19) # Used temporarily for minfi
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(xml2)
+library(R.utils)
+library(GEOquery)
+library(RColorBrewer)
+library(parallel)
+library(wateRmelon)
+library(data.table)
+library(gap)
+
+```
+
+
+```{r}
+sampleSet <- "PPMI_140"
+manifestFile <- "EPIC.hg38.manifest.tsv"
+tissue <- "whole blood"
+array <- "EPIC" # Options: "EPIC", "EPICv2", "EPIC+", "HM450"
+array_gencode <- "v36" # Options: "v36", "v41"
+
+baseDir <- "F:/MetaAnalysisMethylation"
+idatDir_raw <- file.path(baseDir, sampleSet)
+idatDir <- file.path(baseDir, paste0(sampleSet, "_unzipped"))
+dir.create(idatDir, showWarnings = FALSE, recursive = TRUE)
+
+outputDir <- file.path(baseDir, "output")
+tableDir <- file.path(outputDir, "tables")
+plotDir <- file.path(outputDir, "figures")
+```
+
+
+```{r}
+inputDir <- file.path(baseDir, "input")
+dir.create(tableDir, showWarnings = FALSE, recursive = TRUE)
+dir.create(plotDir, showWarnings = FALSE, recursive = TRUE)
+```
+
+
+# Annotations
+
+```{r}
+gz_files <- list.files(inputDir, pattern = "\\.tsv\\.gz$", full.names = TRUE)
+for (file in gz_files) {
+  target_file <- sub("\\.gz$", "", file)
+  if (!file.exists(target_file)) {
+    message("Decompressing: ", basename(file))
+    gunzip(file, destname = target_file, overwrite = FALSE)
+  }
+}
+```
+
+
+
+
+```{r}
+# Manifest files for GRcH38 provided by https://zwdzwd.github.io/InfiniumAnnotation/#human
+
+# Define file paths
+manifest_file <- file.path(inputDir, paste0(array, ".hg38.manifest.tsv"))
+mask_file     <- file.path(inputDir, paste0(array, ".hg38.mask.tsv"))
+gene_file     <- file.path(inputDir, paste0(array, ".hg38.manifest.gencode.", array_gencode, ".tsv"))
+
+
+# Read files 
+df_manifest <- fread(manifest_file, sep = "\t", header = TRUE, na.strings = c("NA", "", "N/A", ".")) %>%
+  as.data.frame() %>%
+  rename(chr = CpG_chrm, start = CpG_beg, end = CpG_end) %>%
+  dplyr::select(Probe_ID, chr, start, end, type, channel, target, nextBase, 
+         address_A, address_B, 
+         mapFlag_A, mapChrm_A, mapPos_A, mapQ_A, 
+         mapFlag_B, mapChrm_B, mapPos_B, mapQ_B) 
+
+df_mask <- fread(mask_file, sep = "\t", header = TRUE, na.strings = c("NA", "", "N/A", ".")) %>%
+  as.data.frame() %>%
+  rename(Probe_ID = probeID) %>%
+  dplyr::select(Probe_ID, MASK_general) 
+
+df_gene <- fread(gene_file, sep = "\t", header = TRUE, na.strings = c("NA", "", "N/A", ".")) %>%
+  as.data.frame() %>%
+  rename(Probe_ID = probeID) %>%
+  dplyr::select(Probe_ID, genesUniq, geneNames, transcriptTypes, transcriptIDs, distToTSS, probe_strand)
+
+
+# Merge all data frames
+anno <- df_manifest %>%
+  left_join(df_mask, by = "Probe_ID") %>%
+  left_join(df_gene, by = "Probe_ID") %>%
+  distinct(Probe_ID, .keep_all = TRUE) # Ensure unique probes if any upstream duplication
+
+
+
+```
+
+```{r}
+write.csv(anno, file.path(tableDir, paste0(sampleSet,"_probe_annotation_GRCh38.csv")), row.names = FALSE)
+
+#anno <- read.csv(file.path(tableDir, paste0(sampleSet,"_probe_annotation.csv")))
+```
+
+# Summary informations
+
+```{r }
+linkData <- data.table::fread(file.path(idatDir_raw, "ppmi_140_link_list_20210607.csv")) %>%
+  as.data.frame() %>%
+  mutate(across(c(PATNO, EVENT_ID, SENTRIXID, POSITION), as.character))
+
+
+pheno <- openxlsx::read.xlsx(file.path(inputDir, "PPMI_Curated_Data_Cut_Public_20250321.xlsx"))
+
+keep <- c(
+  "PATNO" = "PATNO", "EVENT_ID" = "EVENT_ID", "Condition_code" = "COHORT", 
+  "Subgroup" = "subgroup", "Age" = "age_at_visit", "Gender_code" = "SEX", 
+  "LEDD" = "LEDD", "rem" = "rem", 
+  "updrs3_score" = "updrs3_score", "updrs3_score_on" = "updrs3_score_on",
+  "hy" = "hy", "hy_on" = "hy_on",
+  "NHY" = "NHY", "NHY_on" = "NHY_ON"
+)
+
+
+pheno <- pheno %>%
+  dplyr::select(all_of(unname(keep))) %>%
+  rename(any_of(keep)) %>%
+  mutate(
+    Condition = factor(case_when(
+      Condition_code == 1 ~ "Parkinson's disease", 
+      Condition_code == 2 ~ "Control",
+      Condition_code == 3 ~ "SWEDD", 
+      Condition_code == 4 ~ "Prodromal",
+      TRUE ~ NA_character_
+    ), levels = c("Control", "Parkinson's disease", "SWEDD", "Prodromal")),
+    Gender = factor(case_when(
+      Gender_code == 1 ~ "M", 
+      Gender_code == 0 ~ "F",
+      TRUE ~ NA_character_
+    ), levels = c("M", "F"))
+  ) %>%
+  dplyr::select(-any_of(c("Condition_code", "Gender_code")))
+
+# Merge Linking File with Curated Phenotypes
+pheno <- linkData %>%
+  left_join(pheno, by = c("PATNO", "EVENT_ID"))
+
+
+pheno <- pheno %>%
+  filter(
+    !is.na(Condition),
+    !is.na(Gender),
+    !is.na(Subgroup), 
+    !is.na(Age)
+  )
+```
+
+```{r}
+# Calculate counts and percentages
+condition_summary <- pheno %>%
+  dplyr::count(Condition, name = "Count", .drop = FALSE) %>% 
+  dplyr::mutate(Percentage = (Count / sum(Count)) * 100)
+
+
+print(paste0("Distribution of Condition for ", sampleSet, ":"))
+print(condition_summary)
+
+
+# Bar plot for Condition
+ggplot(condition_summary, aes(x = Condition, y = Count, fill = Condition)) +
+  geom_bar(stat = "identity", show.legend = FALSE, alpha = 0.8) +
+  geom_text(aes(label = paste0(Count, "\n(", sprintf("%.1f", Percentage), "%)")), 
+            vjust = -0.3, size = 3.5) + 
+  labs(title = paste("Distribution of Condition -", sampleSet), 
+       x = "Condition", 
+       y = "Number of Samples") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) + 
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5))
+
+```
+
+```{r}
+# Calculate counts and percentages
+subgroup_summary <- pheno %>%
+  dplyr::count(Subgroup, name = "Count", .drop = FALSE) %>% 
+  dplyr::mutate(Percentage = (Count / sum(Count)) * 100)
+
+
+print(paste0("Distribution of Subgroup for ", sampleSet, ":"))
+print(subgroup_summary)
+
+
+# Bar plot for Subgroup
+ggplot(subgroup_summary, aes(x = Subgroup, y = Count, fill = Subgroup)) +
+  geom_bar(stat = "identity", show.legend = FALSE, alpha = 0.8) +
+  geom_text(aes(label = paste0(Count, "\n(", sprintf("%.1f", Percentage), "%)")), 
+            vjust = -0.3, size = 3.5) + 
+  labs(title = paste("Distribution of Subgroup -", sampleSet), 
+       x = "Subgroup", 
+       y = "Number of Samples") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) + 
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5))
+
+```
+
+```{r}
+
+pheno <- pheno %>%  
+  mutate(
+    Condition_sub = case_when(
+      Subgroup == "Healthy Control" ~ "Control",
+      Condition == "Prodromal" ~ "Prodromal",
+      Condition == "Parkinson's disease" & Subgroup == "Sporadic PD" ~ "sPD",
+      Condition == "Parkinson's disease" ~ "fPD", 
+      TRUE ~ NA_character_ 
+    )
+  ) %>%
+  filter(!is.na(Condition_sub))
+
+
+
+```
+
+```{r}
+# Calculate counts and percentages
+subgroup_summary <- pheno %>%
+  dplyr::count(Condition_sub, name = "Count", .drop = FALSE) %>% 
+  dplyr::mutate(Percentage = (Count / sum(Count)) * 100)
+
+
+print(paste0("Distribution of Subgroup for ", sampleSet, ":"))
+print(subgroup_summary)
+
+
+# Bar plot for Subgroup
+ggplot(subgroup_summary, aes(x = Condition_sub, y = Count, fill = Condition_sub)) +
+  geom_bar(stat = "identity", show.legend = FALSE, alpha = 0.8) +
+  geom_text(aes(label = paste0(Count, "\n(", sprintf("%.1f", Percentage), "%)")), 
+            vjust = -0.3, size = 3.5) + 
+  labs(title = paste("Distribution of Subgroup -", sampleSet), 
+       x = "Condition_sub", 
+       y = "Number of Samples") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) + 
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(hjust = 0.5))
+
+```
+
+```{r}
+summary_cond_sub_by_event <- pheno %>%
+  filter(!is.na(EVENT_ID) & !is.na(Condition_sub)) %>% 
+  dplyr::count(EVENT_ID, Condition_sub, name = "Count", .drop = FALSE) %>%
+  dplyr::group_by(EVENT_ID) %>%
+  dplyr::mutate(Percentage_Within_Event = (Count / sum(Count)) * 100) %>%
+  dplyr::ungroup()
+
+
+plot_data_for_event_summary <- summary_cond_sub_by_event %>%
+    mutate(EVENT_ID_Factor = factor(EVENT_ID)) 
+
+ggplot(plot_data_for_event_summary, aes(x = EVENT_ID_Factor, y = Count, fill = Condition_sub)) +
+  geom_bar(stat = "identity", position = position_dodge(preserve = "single"), alpha = 0.8) +
+  labs(title = paste("Distribution of Condition_sub by Event -", sampleSet),
+       x = "EVENT_ID",
+       y = "Number of Samples",
+       fill = "Condition Subgroup") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, size=8), 
+        plot.title = element_text(hjust = 0.5),
+        legend.position = "top")
+
+```
+
+
+```{r}
+write.csv(pheno, file.path(tableDir, paste0(sampleSet,"_sample_phenotype.csv")), row.names = FALSE)
+
+#pheno <- read.csv(file.path(tableDir, paste0(sampleSet,"_sample_phenotype.csv")))
+```
+
+```{r}
+rm(list = c("df_gene", "df_manifest", "df_mask", "linkData"))
+```
+
+
+
+# Methylation data
+
+## Load
+
+### Unzip
+
+```{r}
+idatTempUnzipDir <- file.path(baseDir, paste0(sampleSet, "_temp_unzipped"))
+dir.create(idatTempUnzipDir, showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r}
+zipFiles <- fs::dir_ls(idatDir_raw, glob = "*.zip", recurse = FALSE)
+
+for (zipFile in zipFiles) {
+  zipFileNoExt <- fs::path_ext_remove(basename(zipFile))
+  # Unzip into a subfolder within the temporary directory, named after the zip file
+  individualUnzipDest <- file.path(idatTempUnzipDir, zipFileNoExt)
+  if (!dir.exists(individualUnzipDest) || length(fs::dir_ls(individualUnzipDest)) == 0) { # Only unzip if dest doesn't exist or is empty
+    message("Unzipping: ", basename(zipFile), " to ", individualUnzipDest)
+    dir.create(individualUnzipDest, showWarnings = FALSE, recursive = TRUE)
+    utils::unzip(zipFile, exdir = individualUnzipDest, overwrite = TRUE)
+  }
+}
+```
+
+```{r}
+all_idats_in_temp_unzipped <- fs::dir_ls(idatTempUnzipDir, recurse = TRUE, glob = "*.idat*", type = "file")
+
+destination_paths <- file.path(idatDir, basename(all_idats_in_temp_unzipped))
+files_are_missing <- !fs::file_exists(destination_paths)
+
+source_paths_to_copy <- all_idats_in_temp_unzipped[files_are_missing]
+
+fs::file_copy(source_paths_to_copy, 
+                  new_path = file.path(idatDir, basename(source_paths_to_copy)), 
+                  overwrite = FALSE)
+
+```
+
+
+### Load
+```{r}
+pheno$Slide <- pheno$SENTRIXID
+pheno$Array <- pheno$POSITION
+pheno$Basename <- file.path(idatDir, paste(pheno$Slide, pheno$Array, sep="_") )
+pheno$tissue <- tissue
+pheno$ID <- paste(pheno$PATNO, pheno$EVENT_ID, pheno$Slide, pheno$Array, sep="_")
+pheno$IDarray <- paste(pheno$Slide, pheno$Array, sep="_")
+head(pheno)
+```
+
+```{r}
+targets <- pheno %>%
+  mutate(
+    Sample_Name = paste(PATNO, EVENT_ID, sep="_"),
+    Sample_Group = Condition_sub,
+    Sample_Label = Condition_sub,
+    Sample_Well = NA,
+    Pool_ID = NA,
+    Sample_Source = tissue
+  ) %>%
+  dplyr::select(Sample_Name, Sample_Well, Sample_Source, Sample_Group, Sample_Label, Gender, Age,
+         Pool_ID, Array, Slide, Basename)
+```
+
+```{r}
+# Unzip all .idat.gz files 
+idat_gz_files <- list.files(idatDir, pattern = "\\.idat\\.gz$", full.names = TRUE)
+for (file in idat_gz_files) {
+  target_file <- sub("\\.gz$", "", file)
+  message("Decompressing: ", basename(file))
+  gunzip(file, destname = target_file, overwrite = TRUE)
+}
+
+# Read idat files
+rgSet <- read.metharray.exp(targets = targets, force = TRUE)
+rgSet
+
+#saveRDS(rgSet, file = file.path(idatDir, "rgSet.rds"))
+#rgSet <- readRDS(file.path(idatDir, "rgSet.rds"))
+```
+
+
+
+```{r}
+# Get M/U or Beta values before full normalization
+mSetRaw <- preprocessRaw(rgSet)
+
+```
+
+
+
+## Quality control
+
+```{r}
+qcReport(rgSet, sampNames=targets$Sample_Name, sampGroups=targets$Sample_Group, 
+         pdf=file.path(outputDir, paste0(sampleSet,"_qcReport.pdf")))
+```
+
+### Filter samples
+
+#### 1) Negative Controls
+
+```{r}
+con.red <- getRed(rgSet)[getProbeInfo(rgSet, type = "Control")$Address,]
+rownames(con.red) <- getProbeInfo(rgSet, type = "Control")$ExtendedType
+con.green <- getGreen(rgSet)[getProbeInfo(rgSet, type = "Control")$Address,]
+rownames(con.green) <- getProbeInfo(rgSet, type = "Control")$ExtendedType
+
+### Identify just the negative control probes
+neg.red <- con.red[which(getProbeInfo(rgSet, type = "Control")$Type == "NEGATIVE"),]
+neg.green <- con.green[which(getProbeInfo(rgSet, type = "Control")$Type == "NEGATIVE"),]
+
+neg.red.mean <- colMeans(neg.red)
+neg.green.mean <- colMeans(neg.green)
+green.mean <- colMeans(getGreen(rgSet))
+red.mean <- colMeans(getRed(rgSet))
+
+par(mfrow=c(1,2))
+plot(neg.red.mean, xlab = "Sample", ylab = "Intensity-red", col="grey", pch = 16, ylim = c(0, 12000))
+par(new=TRUE)
+plot(red.mean, xlab = "Sample", ylab = "", col="red", pch = 16, ylim = c(0, 12000))
+plot(neg.green.mean, xlab = "Sample", ylab = "Intensity-green", col="grey", pch = 16, ylim = c(0, 12000))
+par(new=TRUE)
+plot(green.mean, xlab = "Sample", ylab = "", col="Green", pch = 16, ylim = c(0, 12000))
+
+###Detecting the bad samples 
+
+
+bad.neg.red <- names(which(neg.red.mean > 1000))
+bad.low.red <- names(which(red.mean < 2000))
+bad.neg.green <- names(which(neg.red.mean > 1000))
+bad.low.green <- names(which(red.mean < 2000))
+
+BAD.BckgIntensityDiff <- unique(c(bad.neg.red, bad.low.red, bad.neg.green, bad.low.green))
+
+cat("Samples flagged by QC (BckgIntensityDiff):", length(BAD.BckgIntensityDiff), "\n")
+if(length(BAD.BckgIntensityDiff) > 0) print(BAD.BckgIntensityDiff)
+```
+
+
+```{r}
+rm(list = c("con.red", "con.green", "neg.red", "neg.green","neg.red.mean", "neg.green.mean", "green.mean", "red.mean", "bad.neg.red", "bad.low.red", "bad.neg.green", "bad.low.green"))
+```
+
+#### 2) Mean detection p-values
+
+```{r}
+# calculate the detection p-values
+detP <- minfi::detectionP(rgSet)
+avgPval <- colMeans(detP)
+
+# Drop if mean detection p-value per sample is > 0.005
+BAD.BckgIntensityDiffPval <- names(which(avgPval > 0.005))
+cat("Samples flagged by QC (High Avg Detection p-value > 0.005):", length(BAD.BckgIntensityDiffPval), "\n")
+if(length(BAD.BckgIntensityDiffPval) > 0) print(BAD.BckgIntensityDiffPval)
+
+# Remove samples if >5% of their probes have a detection p-value > 0.05
+
+probes_failing_per_sample <- colMeans(detP > 0.05, na.rm = TRUE)
+BAD.BckgIntensityDiffPvalProbe <- names(probes_failing_per_sample)[(probes_failing_per_sample * 100) > 5]
+cat("Samples flagged by QC (More then 5% of probes with a Detection p-value > 0.05):", length(BAD.BckgIntensityDiffPvalProbe), "\n")
+if(length(BAD.BckgIntensityDiffPvalProbe) > 0) print(BAD.BckgIntensityDiffPvalProbe)
+
+
+```
+
+```{r}
+barplot(avgPval, xlab=NULL, ylab="Mean Detection P-value", main="Average Detection p-value per Sample")
+abline(h=0.005, col="red", lty=2) # Example threshold
+```
+
+
+```{r}
+rm(list = c("avgPval", "probes_failing_per_sample"))
+```
+
+#### 3) Extreme Mean M/U Intensities
+
+```{r}
+
+meth_signals <- getMeth(mSetRaw) 
+unmeth_signals <- getUnmeth(mSetRaw)
+
+M.mean <- colMeans(meth_signals, na.rm = TRUE)
+U.mean <- colMeans(unmeth_signals, na.rm = TRUE)
+
+Mean.M <- mean(M.mean, na.rm = TRUE)
+Mean.U <- mean(U.mean, na.rm = TRUE)
+sd.M <- sd(M.mean, na.rm = TRUE)
+sd.U <- sd(U.mean, na.rm = TRUE)
+
+
+par(mfrow=c(1,2))
+
+#plots of average sample intensites and threshold lines to see if signals were sufficiently high
+Sex<-as.factor(pheno$Gender)
+plot(M.mean, U.mean, pch = 16, xlab = "Mean M intensity", ylab = "Mean U intensity", col = rainbow(nlevels(Sex))[factor(Sex)], main="BS Signal Intensities Coloured by Sex")
+legend("topleft", legend=levels(factor(Sex)), col = rainbow(nlevels(Sex)), pch = 16, cex=0.6)
+
+Slide<-as.factor(pheno$Slide)
+plot(M.mean, U.mean, pch = 16, xlab = "Mean M intensity", ylab = "Mean U intensity", col = rainbow(nlevels(Slide))[factor(Slide)], main="BS Signal Intensities Coloured by Slide")
+legend("topleft", legend=levels(factor(Slide)), col = rainbow(nlevels(Slide)), pch = 16, cex=0.6)	
+
+
+###Detecting the bad samples 
+
+outlier.indices <- which(Mean.M + 3*sd.M < M.mean | M.mean < Mean.M - 3*sd.M | 
+                         Mean.U + 3*sd.U < U.mean | U.mean < Mean.U - 3*sd.U)
+BAD.signalsd <- colnames(mSetRaw)[outlier.indices]
+
+cat("Samples flagged by QC (signalsd):", length(BAD.signalsd), "\n")
+if(length(BAD.signalsd) > 0) print(BAD.signalsd)
+
+
+```
+
+```{r}
+rm(list = c("meth_signals", "unmeth_signals", "M.mean", "U.mean", "Mean.M", "Mean.U", "sd.M", "sd.U", "outlier.indices", "Sex", "Slide"))
+```
+
+
+
+#### 4) Bisulfite conversion efficiency < 80%
+
+```{r}
+
+bs_conversion_stats <- wateRmelon::bscon(rgSet) 
+
+hist(bs_conversion_stats, xlab = "Mean % BS conversion", main = "Bisulfite Conversion Efficiency")
+abline(v=80, col="red", lty=2)
+
+BAD.bisulfidconv <- colnames(rgSet)[which(bs_conversion_stats < 80)]
+cat("Samples flagged by QC.d (Bisulfite Conversion < 80%):", length(BAD.bisulfidconv), "\n")
+if(length(BAD.bisulfidconv) > 0) print(BAD.bisulfidconv)
+```
+
+
+```{r}
+rm(list = c("bs_conversion_stats"))
+```
+
+
+
+#### 5) SNP correlations
+
+```{r}
+# Get SNP beta values
+snp_betas <- minfi::getSnpBeta(rgSet)
+
+unique_event_ids <- unique(pheno$EVENT_ID[!is.na(pheno$EVENT_ID)])
+
+all_flagged_samples_across_events <- character(0)
+
+# Loop through each EVENT_ID
+for (current_event_id in unique_event_ids) {
+  cat(paste0("Processing EVENT_ID: ", current_event_id, "\n"))
+  
+  # Get Sample_Names for the current EVENT_ID
+  samples_this_event <- pheno[pheno$EVENT_ID == current_event_id,]$IDarray
+  
+  # Subset SNP betas for these samples
+  snp_betas_event <- snp_betas[, samples_this_event, drop = FALSE]
+  
+  # Calculate pairwise correlations within this event's samples
+  snpCor_event <- cor(snp_betas_event, use = "complete.obs")
+  diag(snpCor_event) <- NA # Ignore self-correlations
+  
+  # Find maximum correlation for each sample *within this event*
+  corMax_event <- apply(snpCor_event, 1, max, na.rm = TRUE)
+  corMax_event[is.infinite(corMax_event)] <- NA # Handle -Inf if all other corrs were NA
+  
+  # Identify samples within this event having high correlation with another sample *in the same event*
+  flagged_samples_this_event <- names(which(corMax_event > 0.65))
+  
+  if (length(flagged_samples_this_event) > 0) {
+    cat("  Flagged samples in EVENT_ID", current_event_id, "(cor > 0.65):", 
+        length(flagged_samples_this_event), "\n")
+    print(flagged_samples_this_event)
+    all_flagged_samples_across_events <- c(all_flagged_samples_across_events, flagged_samples_this_event)
+  } else {
+    cat("  No samples flagged for high genetic correlation in EVENT_ID:", current_event_id, "\n")
+  }
+
+  # Plot histogram per EVENT_ID 
+
+   hist(corMax_event[!is.na(corMax_event)],
+        xlab = "Max. Inter-sample Correlation (SNP probes)",
+        main = paste("SNP Correlation - Event:", current_event_id, "\nCohort:", sampleSet),
+        breaks = 20, col = "purple")
+   abline(v = 0.65, col = "red", lty = 2)
+   legend("topright", legend = "Threshold (0.65)", col = "red", lty = 2, cex = 0.8)
+
+
+}
+
+
+BAD.geneticrelationship <- unique(all_flagged_samples_across_events)
+cat("\nTotal unique samples flagged by QC.f across all events (High Genetic Correlation > 0.65 within an event):\n")
+cat("Number of samples:", length(BAD.geneticrelationship), "\n")
+if (length(BAD.geneticrelationship) > 0) {
+  print(BAD.geneticrelationship)
+}
+
+
+```
+
+```{r}
+rm(list = c("snp_betas", "snpCor_event", "corMax_event", "flagged_samples_this_event", "all_flagged_samples_across_events"))
+```
+
+#### 6) Sex mismatch
+
+```{r}
+GRset <- mapToGenome(ratioConvert(mSetRaw))
+predictedSex <- getSex(GRset, cutoff = -2)
+reported_sex <- pData(mSetRaw)$Gender
+
+
+df_sex <- as.data.frame(predictedSex)
+df_sex$Sample <- rownames(df_sex)
+df_sex <- merge(df_sex, pheno[, c("IDarray", "Gender")], by.x = "Sample", by.y = "IDarray", all.x = TRUE)
+ggplot(df_sex, aes(x = xMed, y = yMed, color = Gender)) +
+  geom_point(size = 2, alpha = 0.7) +
+  scale_color_manual(values = c(M = "blue", F = "red")) +
+  labs(
+    title = "Sex Prediction by chrX and chrY intensities (Colored by Reported Gender)",
+    x = "chrX median intensity",
+    y = "chrY median intensity",
+    color = "Reported Gender"
+  ) +
+  theme_minimal()
+
+
+mismatched_indices <- which(predictedSex$predictedSex != reported_sex & 
+                            !is.na(reported_sex) & 
+                            !is.na(predictedSex$predictedSex))
+
+
+
+
+BAD.sexmismatch <- colnames(mSetRaw)[mismatched_indices]
+cat("Samples flagged by QC (sex mismatch):", length(BAD.sexmismatch), "\n")
+if(length(BAD.sexmismatch) > 0) print(BAD.sexmismatch)
+
+
+```
+
+```{r}
+rm(list = c("GRset", "predictedSex", "reported_sex", "mismatched_indices", "df_sex"))
+```
+
+#### 7) Other tissue
+```{r}
+BAD.tissue <- pheno[!pheno$Tissue == tissue, ]$ID
+cat("Samples flagged by QC (tissue):", length(BAD.tissue), "\n")
+if(length(BAD.tissue) > 0) print(BAD.tissue)
+```
+
+#### Remove bad samples
+```{r}
+all_bad_samples <- unique(c(
+  BAD.BckgIntensityDiff, 
+  BAD.BckgIntensityDiffPval,
+  BAD.BckgIntensityDiffPvalProbe,
+  BAD.signalsd,
+  BAD.bisulfidconv,
+  BAD.sexmismatch, 
+  BAD.geneticrelationship,
+  BAD.tissue
+))
+
+cat("Total unique samples flagged for removal by QC steps:", length(all_bad_samples), "\n")
+if(length(all_bad_samples) > 0) print(all_bad_samples)
+```
+
+```{r}
+#rgSet_backup <- rgSet
+rgSet <- rgSet[, !colnames(rgSet) %in% all_bad_samples]
+```
+
+```{r}
+rm(list = c("mSetRaw"))
+gc()
+```
+
+### Cell types
+
+```{r}
+pData(rgSet)$Slide <- as.numeric(pData(rgSet)$Slide)
+if (array == "HM450"){
+  library(FlowSorted.Blood.450k)
+  cellCounts <- estimateCellCounts(rgSet)
+} else if (array %in% c("EPIC", "EPICv2", "EPIC+")) {
+  library(FlowSorted.Blood.EPIC)
+  FlowSorted.Blood.EPIC <- libraryDataGet('FlowSorted.Blood.EPIC')
+  cellCounts <- estimateCellCounts(rgSet, 
+                                   compositeCellType = "Blood", 
+                                   cellTypes = c("CD8T", "CD4T", "NK", "Bcell", "Mono", "Neu"),
+                                   referencePlatform = "IlluminaHumanMethylationEPIC"
+                                   )
+}
+
+
+#cellCounts_backup <- cellCounts
+```
+
+```{r}
+# plot cell type proportions by condition
+cell_type_names <- colnames(cellCounts)
+
+
+plot_data_long <- cellCounts %>%
+  as.data.frame() %>% 
+  tibble::rownames_to_column(var = "Sample_Name") %>%
+  left_join(pheno %>%
+            mutate(Sample_Name = IDarray,
+                   Sample_Group = Condition_sub) %>%
+            dplyr::select(Sample_Name, Sample_Group), by = "Sample_Name") %>%
+  pivot_longer(cols = all_of(cell_type_names), 
+               names_to = "CellType", 
+               values_to = "Proportion") 
+
+# Ensure CellType is a factor to control plotting order
+plot_data_long$CellType <- factor(plot_data_long$CellType, levels = cell_type_names)
+plot_data_long$Sample_Group <- factor(plot_data_long$Sample_Group, levels = c("Control", "sPD", "fPD", "Prodromal"))
+
+
+ggplot(plot_data_long, aes(x = CellType, y = Proportion, fill = Sample_Group)) +
+  geom_boxplot(position = position_dodge(width = 0.8), alpha = 0.7) +
+  labs(x = "Cell Type", y = "Cell Type Proportion") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+```{r}
+rm(list = c("plot_data_long", "FlowSorted.Blood.EPIC"))
+
+```
+
+
+### Normalize
+
+
+
+```{r}
+GRset.quantile <- preprocessQuantile(rgSet, fixOutliers = TRUE,
+  removeBadSamples = FALSE, 
+  quantileNormalize = TRUE, stratified = TRUE, 
+  mergeManifest = FALSE)
+```
+
+
+```{r}
+par(mfrow=c(1,2))
+densityPlot(rgSet, sampGroups=targets$Sample_Group,main="Raw", legend=FALSE)
+legend("top", legend = levels(factor(targets$Sample_Group)), 
+       text.col=brewer.pal(2,"Dark2"))
+densityPlot(getBeta(GRset.quantile), sampGroups=targets$Sample_Group,
+            main="Normalized", legend=FALSE)
+legend("top", legend = levels(factor(targets$Sample_Group)), 
+       text.col=brewer.pal(2,"Dark2"))
+```
+```{r}
+saveRDS(rgSet, file = file.path(idatDir, "rgSet.rds"))
+#rgSet <- readRDS(file.path(idatDir, "rgSet.rds"))
+rm("rgSet")
+```
+
+### Filter probes
+
+#### Failed probes
+```{r}
+# Drop probes that failed (detection p-value > 0.05) in more than 1% of samples
+current_samples <- colnames(GRset.quantile)
+current_probes  <- rownames(GRset.quantile)
+
+detP_aligned <- detP[current_probes, current_samples]
+
+
+samples_failing_per_probe <- rowMeans(detP_aligned > 0.05, na.rm = TRUE)
+
+probes_to_remove <- names(samples_failing_per_probe)[(samples_failing_per_probe * 100) > 1]
+
+keep <- setdiff(current_probes, probes_to_remove)
+
+GRset.quantile <- GRset.quantile[keep,] 
+
+cat("Number of probes removed due to detection p-value filter (>1% failures):", length(probes_to_remove), "\n")
+cat("Remaining probes:", length(featureNames(GRset.quantile)), "\n")
+```
+
+
+```{r}
+rm(list = c("detP", "current_samples", "current_probes", "detP_aligned", "samples_failing_per_probe", "probes_to_remove", "keep"))
+```
+
+#### Cross hybridisation
+```{r}
+ReactiveProbes <- read.csv(file=file.path(inputDir,
+                                       "48639-non-specific-probes-Illumina450k.csv"), stringsAsFactors=FALSE)
+
+# probes from Pidsley 2016 (EPIC)
+epic.cross <- read.csv(file.path(inputDir, '13059_2016_1066_MOESM1_ESM.csv'), head = T)
+
+
+drop <- unique(c(as.character(ReactiveProbes$TargetID), as.character(epic.cross$X)))
+
+probes_beforeFilter <- length(featureNames(GRset.quantile))
+GRset.quantile <- GRset.quantile[!(featureNames(GRset.quantile) %in% drop),] 
+
+cat("Number of probes removed due to cross hybridisation:", (probes_beforeFilter - length(featureNames(GRset.quantile))), "\n")
+cat("Remaining probes:", length(featureNames(GRset.quantile)), "\n")
+
+```
+
+```{r}
+rm(list = c("ReactiveProbes", "keep", "epic.cross"))
+```
+
+#### Loci with SNPs
+```{r}
+
+
+GRset.quantile <- dropLociWithSnps(GRset.quantile, snps=c("SBE","CpG"), maf=0)
+
+cat("Number of probes removed/ Loci with SNPs:", (probes_beforeFilter - length(featureNames(GRset.quantile))), "\n")
+cat("Remaining probes:", length(featureNames(GRset.quantile)), "\n")
+```
+
+```{r}
+rm(list = c("probes_beforeFilter"))
+```
+
+#### Probes on sex chromosomes
+
+```{r}
+probes_beforeFilter <- length(featureNames(GRset.quantile))
+keep <- !(featureNames(GRset.quantile) %in% anno$Probe_ID[anno$chr %in% 
+                                                        c("chrX","chrY")])
+GRset.quantile <- GRset.quantile[keep,]
+
+cat("Number of probes removed (on the sex chromosomes):", (probes_beforeFilter - length(featureNames(GRset.quantile))), "\n")
+cat("Remaining probes:", length(featureNames(GRset.quantile)), "\n")
+```
+
+```{r}
+rm(list = c("probes_beforeFilter", "keep"))
+```
+
+#### Probes that are marked in anno
+
+```{r}
+probes_beforeFilter <- length(featureNames(GRset.quantile))
+keep <- intersect(rownames(GRset.quantile), anno$Probe_ID[anno$MASK_general == FALSE])
+GRset.quantile <- GRset.quantile[keep,]
+
+cat("Number of probes removed (marked in anno):", (probes_beforeFilter - length(featureNames(GRset.quantile))), "\n")
+cat("Remaining probes:", length(featureNames(GRset.quantile)), "\n")
+```
+
+```{r}
+rm(list = c("probes_beforeFilter", "keep"))
+```
+
+
+
+
+### beta and m values
+
+```{r}
+bVals <- getBeta(GRset.quantile)
+mVals <- getM(GRset.quantile)
+```
+
+```{r}
+par(mfrow=c(1,2))
+densityPlot(bVals, sampGroups=targets$Sample_Group, main="Beta values", 
+            legend=FALSE, xlab="Beta values")
+legend("top", legend = levels(factor(targets$Sample_Group)), 
+       text.col=brewer.pal(2,"Dark2"))
+densityPlot(mVals, sampGroups=targets$Sample_Group, main="M-values", 
+            legend=FALSE, xlab="M values")
+legend("topleft", legend = levels(factor(targets$Sample_Group)), 
+       text.col=brewer.pal(2,"Dark2"))
+```
+
+```{r}
+filePath <- file.path(tableDir, paste0(sampleSet,"_beta_values.tsv.gz"))
+gz_file <- gzfile(filePath, "w")
+write.table(bVals, file = gz_file, sep = "\t", quote = FALSE, row.names = TRUE, col.names = NA)
+close(gz_file)
+```
+
+```{r}
+
+saveRDS(GRset.quantile, file = file.path(idatDir, "GRset.quantile.rds"))
+
+#GRset.quantile=readRDS(file.path(idatDir, "GRset.quantile.rds"))
+#rgSet=readRDS(file.path(idatDir, "rgSet.rds"))
+#GRset.quantile=readRDS(file.path(idatDir, "GRset.quantile.rds"))
+```
+
+
+## Differential analysis (Ctrl vs. PD at baseline - for meta analysis)
+### Subset
+
+```{r}
+#cellCounts_backup <- cellCounts
+cellCounts <- as.data.frame(cellCounts)
+cellCounts$IDarray <- rownames(cellCounts)
+write.csv(cellCounts, file=file.path(tableDir, paste0(sampleSet, "_cell_counts.csv")))
+
+#cellCounts <- read.csv(file.path(tableDir, paste0(sampleSet, "_cell_counts.csv")))
+```
+
+
+```{r}
+pheno_backup <- pheno
+pheno <- pheno[match(colnames(GRset.quantile), pheno$IDarray), ]
+
+pheno <- pheno %>%
+  filter(Condition_sub %in% c("Control", "sPD") & EVENT_ID == "BL") %>%
+  mutate(
+    Condition_sub = case_when(
+      Condition_sub == "sPD" ~ "Parkinson's disease",
+      Condition_sub == "Control" ~ "Control", 
+      TRUE ~ as.character(Condition_sub)
+    )
+  )
+pheno$Condition_sub <- factor(pheno$Condition_sub, levels = c("Control", "Parkinson's disease"))
+cellCounts <- cellCounts[rownames(cellCounts) %in% pheno$IDarray, ]
+pheno <- merge(pheno, cellCounts, by = "IDarray" )
+
+bVals <- bVals[, colnames(bVals) %in% pheno$IDarray]
+mVals <- mVals[, colnames(mVals) %in% pheno$IDarray]
+
+```
+
+### Harmonization
+#### Set up covariates
+
+```{r}
+
+
+# Calculate variance for each cell type
+cell_variances <- apply(cellCounts[,colnames(cellCounts) != "IDarray"], 2, var)
+
+# Sort by variance
+sorted_var <- sort(cell_variances)
+sorted_var
+cat("\n")
+cat("Dropping cell type with the lowest variance:", names(sorted_var)[1])
+
+cell_type_covs <- setdiff(names(cell_variances), names(sorted_var)[1])
+
+covariates <- c("Age", "Gender", cell_type_covs)
+
+```
+
+#### Get harmonized residuals from m-values
+
+```{r}
+
+# Drop samples with missing descriptions
+pheno_harmonized <- pheno[complete.cases(pheno[, covariates]), ]
+bVals_harmonized <- bVals[, pheno_harmonized$IDarray]
+mVals_harmonized <- mVals[, pheno_harmonized$IDarray]
+
+# Design matrix
+design <- model.matrix(
+  as.formula(paste("~", paste(covariates, collapse = " + "))),
+  data = pheno_harmonized
+)
+
+# Fit and get residuals
+fit <- lmFit(mVals_harmonized, design)
+resid_mVals <- residuals(fit, y = mVals_harmonized)
+
+
+```
+
+```{r}
+filePath <- file.path(tableDir, paste0(sampleSet,"_resid_mVals.tsv.gz"))
+gz_file <- gzfile(filePath, "w")
+write.table(resid_mVals, file = gz_file, sep = "\t", quote = FALSE, row.names = TRUE, col.names = NA)
+close(gz_file)
+```
+
+#### Correct beta values for fold changes
+```{r}
+# Fit model to beta values
+fit_beta <- lmFit(bVals_harmonized, design)
+
+# Extract residuals and add back the rowMeans to recover scale
+resid_bVals <- residuals(fit_beta, y = bVals_harmonized)
+corrected_bVals <- resid_bVals + rowMeans(bVals_harmonized, na.rm = TRUE)
+
+# Clip extreme values to valid [0,1] range
+corrected_bVals[corrected_bVals < 0] <- 0
+corrected_bVals[corrected_bVals > 1] <- 1
+```
+
+
+```{r}
+filePath <- file.path(tableDir, paste0(sampleSet,"_beta_values_corrected.tsv.gz"))
+gz_file <- gzfile(filePath, "w")
+write.table(corrected_bVals, file = gz_file, sep = "\t", quote = FALSE, row.names = TRUE, col.names = NA)
+close(gz_file)
+```
+
+```{r}
+rm(list = c("bVals", "mVals", "mVals_harmonized", "resid_bVals", "GRset.quantile", "fit", "fit_beta"))
+```
+
+
+
+
+### Differential analysis
+
+
+```{r}
+diff_pipeline <- function(
+    comparison_name,
+    sampleSet, 
+    pheno_full, 
+    bvals_full, 
+    mvals_full, 
+    case_group, 
+    control_group = "CONTR", 
+    anno_df) 
+{
+  
+  
+  cat("\n\n========================================================\n")
+  cat("--- Starting Analysis for Comparison: ", comparison_name, " ---\n")
+  cat("========================================================\n")
+  
+  # 1. Subset Data for the current comparison
+  pheno_subset <- pheno_full %>%
+    filter(Condition_sub %in% c(control_group, case_group)) %>%
+    mutate(
+      Condition_sub = factor(
+        ifelse(Condition_sub %in% case_group, "Case", "Control"),
+        levels = c("Control", "Case")
+      )
+    )
+  samples_ctrl <- pheno_subset$IDarray[pheno_subset$Condition_sub == "Control"]
+  samples_case <- pheno_subset$IDarray[pheno_subset$Condition_sub == "Case"]
+  
+  N_ctrl <- length(samples_ctrl)
+  N_case <- length(samples_case)
+  
+  cat("Found n Control samples: ", N_ctrl, "\n")
+  cat("Found n", case_group, "samples: ", N_case, "\n")
+  
+  bvals_subset <- bvals_full[, pheno_subset$IDarray, drop = FALSE]
+  mvals_subset <- mvals_full[, pheno_subset$IDarray, drop = FALSE]
+  
+  # 2. Surrogate Variable Analysis
+  # Define full models
+  mod <- model.matrix(~ Condition_sub, data = pheno_subset)
+  mod0 <- model.matrix(~ 1, data = pheno_subset)
+  
+  # Estimate "significant" n.sv (for reporting purposes)
+  n_sv_leek <- num.sv(as.matrix(mvals_subset), mod, method = "leek")
+  cat("num.sv() estimated", n_sv_leek, "significant SVs.\n")
+  
+  # Calculate SVs to test from (up to 20)
+  junk_output <- capture.output(
+    sva_obj <- sva(as.matrix(mvals_subset), mod, mod0, n.sv = 20)
+  )
+  
+  # 3. Run Limma and control for Lambda
+  cat("Iteratively fitting limma to find optimal number of SVs (target lambda < 1.2)\n")
+  
+  final_results <- list()
+  for (k in 0:sva_obj$n.sv) {
+    cat("  Numbers of SV:", k, "\n")
+    # Create the design matrix for this iteration
+    if (k == 0) {
+      mod_final <- mod 
+    } else {
+      svs_to_include <- sva_obj$sv[, 1:k, drop = FALSE]
+      mod_final <- cbind(mod, svs_to_include)
+    }
+    
+    # Fit the limma model
+    fit <- lmFit(mvals_subset, mod_final)
+    fit <- eBayes(fit)
+    
+    # Extract p-values for the 'Condition_sub' effect
+    p_values <- fit$p.value[, "Condition_subCase"]
+    
+    # Calculate Lambda
+    lambda <- gc.lambda(p_values)
+    cat("    Genomic Inflation Factor (Lambda):", round(lambda, 3), "\n")
+    
+    # Get number of significant probes for this iteration
+    fdr_values <- p.adjust(p_values, method = "BH")
+    num_sig_probes <- sum(fdr_values < 0.05, na.rm = TRUE)
+    
+    cat("    Significant Probes (FDR < 0.05) =", num_sig_probes, "\n")
+    
+    # Get the full topTable results
+    results <- limma::topTable(fit, coef = "Condition_subCase", number = Inf, sort.by = "P")
+      
+    # Add mean beta-values and effect size from the bvals_subset
+    mean_ctrl <- rowMeans(bvals_subset[, pheno_subset$Condition_sub == "Control"], na.rm = TRUE)
+    mean_case <- rowMeans(bvals_subset[, pheno_subset$Condition_sub == "Case"], na.rm = TRUE)
+    
+    results$Probe_ID <- rownames(results)
+    results$mean_Control <- mean_ctrl[results$Probe_ID]
+    results$mean_Case <- mean_case[results$Probe_ID]
+    results$effect_size <- results$mean_Control-results$mean_Case
+    
+    # Annotate with your main 'anno' object
+    results <- results %>%
+      left_join(anno, by = "Probe_ID")
+  
+    final_results[[paste0("SVs_", k)]] <- results
+    write.csv(results, 
+          file.path(tableDir, paste0(sampleSet, "_results_", comparison_name, "_with_",k,"SVs.csv")), 
+          row.names = FALSE)
+    # Check if lambda is controlled
+    if (lambda < 1.2) {
+      break 
+    }
+  } 
+  saveRDS(final_results, file = file.path(outputDir, paste0(sampleSet, "_",comparison_name, "_final_results.csv")))
+  return(final_results)
+}
+```
+
+```{r}
+anno_to_add <- anno %>%
+  dplyr::select(
+    Probe_ID, 
+    chr, 
+    start, 
+    end, 
+    genesUniq, 
+    geneNames, 
+    transcriptTypes, 
+    transcriptIDs, 
+    distToTSS
+  )
+```
+
+```{r}
+
+
+results_PD <- diff_pipeline(
+  comparison_name = "Ctrl_PD",
+  sampleSet = sampleSet,
+  pheno_full = pheno_harmonized,
+  bvals_full = bVals_harmonized, 
+  mvals_full = resid_mVals,     
+  case_group = "Parkinson's disease",
+  control_group = "Control",
+  anno_df = anno_to_add
+)
+
+
+```
+
+

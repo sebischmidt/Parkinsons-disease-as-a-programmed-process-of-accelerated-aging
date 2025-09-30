@@ -1,0 +1,889 @@
+---
+title: "Methylation data - frontal cortex"
+author: "Sebastian Schmidt"
+date: "2025-06-25"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+knitr::opts_knit$set(root.dir = "F:/MetaAnalysisMethylation")
+
+library(ggplot2)
+library(dplyr)
+library(data.table)
+library(tibble)
+library(ggrastr)
+library(ggrepel)
+library(tidyr)
+library(stringr)
+library(ggnewscale)
+library(fuzzyjoin)
+library(purrr)
+library(readxl)
+library(clusterProfiler)
+library(enrichplot)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(biomaRt)
+library(ReactomePA)
+library(xlsx)
+library(gtools)
+
+```
+
+```{r}
+sampleSet <- 'GSE203332'
+
+baseDir <- "F:/MetaAnalysisMethylation"
+outputDir <- file.path(baseDir, "output")
+tableDir <- file.path(outputDir, "tables")
+plotDir <- file.path(outputDir, "figures")
+```
+
+
+```{r}
+inputDir <- file.path(baseDir, "input")
+dir.create(tableDir, showWarnings = FALSE, recursive = TRUE)
+dir.create(plotDir, showWarnings = FALSE, recursive = TRUE)
+```
+
+
+# Functions
+```{r}
+# function for pathway enrichment analysis and saving
+pathway_enrichment <- function(data, sampleSet=sampleSet, comparisonName = "CtrlvsPD", save_dir=tableDir){
+
+  # Read in mart for conversion of HGNC symbol to Entrez ID
+  mart = useDataset("hsapiens_gene_ensembl", useEnsembl(biomart="ensembl"))
+  
+  # Generate output file
+  write.xlsx("This table contains pathway enrichment results", 
+             file = paste(save_dir, "/", sampleSet, "_DMR_", comparisonName, "_pathway_enrichment_promoter.xlsx", sep = ""), 
+             sheetName = "Summary", row.names = FALSE, col.names = FALSE)
+  
+  write.xlsx("This table contains pathway enrichment results", 
+             file = paste(save_dir, "/", sampleSet, "_DMR_", comparisonName, "_pathway_enrichment_all.xlsx", sep = ""), 
+             sheetName = "Summary", row.names = FALSE, col.names = FALSE)
+
+  # All DMPs/DMRs
+  try(gene <- unique(data$gene_name), silent = TRUE)
+  
+  try(cat("Number of genes associated with DMRs:", length(gene), "\n"), silent = TRUE)
+  cat("Processing all DMRs....", "\n")
+  
+  ## Get Entrez ID
+  try(G_list <- getBM(filters= "hgnc_symbol", attributes= c("ensembl_gene_id", "hgnc_symbol", "entrezgene_id"), values=gene, mart=mart), silent = TRUE)
+  try(gene <- unique(G_list$entrezgene_id), silent = TRUE)
+  
+  ## GO terms
+  try(ego_ALL <- enrichGO(gene          = gene,
+                      OrgDb         = org.Hs.eg.db,
+                      ont           = "ALL",
+                      keyType = "ENTREZID",
+                      pAdjustMethod = "fdr",
+                      qvalueCutoff  = 1,
+                      pvalueCutoff = 1,
+                      readable      = TRUE), silent = TRUE)
+
+  try(write.xlsx(ego_ALL, 
+             file = paste(save_dir, "/", sampleSet, "_DMR_", comparisonName, "_pathway_enrichment_all.xlsx", sep = ""), 
+             sheetName = "GO", row.names = FALSE, append = TRUE), silent = TRUE)
+  try(ego_ALL <- as.data.frame(ego_ALL), silent = TRUE)
+  try(cat("  Number of significantly enriched GO terms:", length(ego_ALL[ego_ALL$qvalue<0.05,]$ID), "\n"), silent = TRUE)
+  
+  ## KEGG terms
+  try(ekegg <- suppressWarnings(enrichKEGG(gene = gene, pvalueCutoff = 1, qvalueCutoff  = 1)), silent = TRUE)
+  try(ekegg <- setReadable(ekegg, OrgDb = org.Hs.eg.db, keyType="ENTREZID"), silent = TRUE)
+  
+  try(write.xlsx(ekegg, 
+             file = paste(save_dir, "/", sampleSet, "_DMR_", comparisonName, "_pathway_enrichment_all.xlsx", sep = ""), 
+             sheetName = "KEGG", row.names = FALSE, append = TRUE), silent = TRUE)
+  try(ekegg <- as.data.frame(ekegg), silent = TRUE) 
+  try(cat("  Number of significantly enriched KEGG terms:", length(ekegg[ekegg$qvalue<0.05,]$ID), "\n"), silent = TRUE)
+  
+  ## mKEGG terms
+  try(emkegg <- suppressWarnings(enrichMKEGG(gene = gene, pvalueCutoff = 1, qvalueCutoff  = 1)), silent = TRUE)
+  try(emkegg <- setReadable(emkegg, OrgDb = org.Hs.eg.db, keyType="ENTREZID"), silent = TRUE)
+  
+  try(write.xlsx(emkegg, 
+             file = paste(save_dir, "/", sampleSet, "_DMR_", comparisonName, "_pathway_enrichment_all.xlsx", sep = ""), 
+             sheetName = "mKEGG", row.names = FALSE, append = TRUE), silent = TRUE)
+  try(emkegg <- as.data.frame(emkegg), silent = TRUE) 
+  try(cat("  Number of significantly enriched mKEGG terms:", length(emkegg[emkegg$qvalue<0.05,]$ID), "\n"), silent = TRUE)
+  
+  ## WP terms
+  try(ewp <- suppressWarnings(enrichWP(gene = gene, organism = "Homo sapiens", pvalueCutoff = 1, qvalueCutoff  = 1)), silent = TRUE)
+  try(ewp <- setReadable(ewp, OrgDb = org.Hs.eg.db, keyType="ENTREZID"), silent = TRUE)
+  
+  try(write.xlsx(ewp, 
+             file = paste(save_dir, "/", sampleSet, "_DMR_", comparisonName, "_pathway_enrichment_all.xlsx", sep = ""), 
+             sheetName = "WP", row.names = FALSE, append = TRUE), silent = TRUE)
+  try(ewp <- as.data.frame(ewp), silent = TRUE) 
+  try(cat("  Number of significantly enriched WP terms:", length(ewp[ewp$qvalue<0.05,]$ID), "\n"), silent = TRUE)
+  
+  ## Reactome terms
+  try(ereactome <- suppressWarnings(enrichPathway(gene=gene, qvalueCutoff  = 1, pvalueCutoff = 1, readable=TRUE)), silent = TRUE)
+  
+  try(write.xlsx(ereactome, 
+             file = paste(save_dir, "/", sampleSet, "_DMR_", comparisonName, "_pathway_enrichment_all.xlsx", sep = ""), 
+             sheetName = "Reactome", row.names = FALSE, append = TRUE), silent = TRUE)
+  try(ereactome <- as.data.frame(ereactome), silent = TRUE) 
+  try(cat("  Number of significantly enriched Reactome terms:", length(ereactome[ereactome$qvalue<0.05,]$ID), "\n"), silent = TRUE)
+  
+  ## deleate arguments
+  try(rm(gene, G_list), silent = TRUE)
+  try(rm(ego_ALL), silent = TRUE)
+  try(rm(ekegg), silent = TRUE)
+  try(rm(emkegg), silent = TRUE)
+  try(rm(ewp), silent = TRUE)
+  try(rm(ereactome), silent = TRUE)
+  
+  # DMRs overlap with promoters
+  try(gene <- unique(data[data$type == "promoter",]$gene_name), silent = TRUE)
+  
+  try(cat("Number of genes associated with DMRs in promoters:", length(gene), "\n"), silent = TRUE)
+  cat("Processing DMRs within promoters....", "\n")
+  
+  ## Get Entrez ID
+  try(G_list <- getBM(filters= "hgnc_symbol", attributes= c("ensembl_gene_id", "hgnc_symbol", "entrezgene_id"), values=gene, mart=mart), silent = TRUE)
+  try(gene <- unique(G_list$entrezgene_id), silent = TRUE)
+  
+  ## GO terms
+  try(ego_ALL <- enrichGO(gene          = gene,
+                      OrgDb         = org.Hs.eg.db,
+                      ont           = "ALL",
+                      keyType = "ENTREZID",
+                      pAdjustMethod = "fdr",
+                      pvalueCutoff = 1,
+                      qvalueCutoff  = 1,
+                      readable      = TRUE), silent = TRUE)
+
+  try(write.xlsx(ego_ALL, 
+             file = paste(save_dir, "/", sampleSet, "_DMR_", comparisonName, "_pathway_enrichment_promoter.xlsx", sep = ""), 
+             sheetName = "GO", row.names = FALSE, append = TRUE), silent = TRUE)
+  try(ego_ALL <- as.data.frame(ego_ALL), silent = TRUE)
+  try(cat("  Number of significantly enriched GO terms:", length(ego_ALL[ego_ALL$qvalue<0.05,]$ID), "\n"), silent = TRUE)
+  
+  ## KEGG terms
+  try(ekegg <- suppressWarnings(enrichKEGG(gene = gene, pvalueCutoff = 1, qvalueCutoff  = 1)), silent = TRUE)
+  try(ekegg <- setReadable(ekegg, OrgDb = org.Hs.eg.db, keyType="ENTREZID"), silent = TRUE)
+  
+  try(write.xlsx(ekegg, 
+             file = paste(save_dir, "/", sampleSet, "_DMR_", comparisonName, "_pathway_enrichment_promoter.xlsx", sep = ""), 
+             sheetName = "KEGG", row.names = FALSE, append = TRUE), silent = TRUE)
+  try(ekegg <- as.data.frame(ekegg), silent = TRUE) 
+  try(cat("  Number of significantly enriched KEGG terms:", length(ekegg[ekegg$qvalue<0.05,]$ID), "\n"), silent = TRUE)
+  
+  ## mKEGG terms
+  try(emkegg <- suppressWarnings(enrichMKEGG(gene = gene, pvalueCutoff = 1, qvalueCutoff  = 1)), silent = TRUE)
+  try(emkegg <- setReadable(emkegg, OrgDb = org.Hs.eg.db, keyType="ENTREZID"), silent = TRUE)
+  
+  try(write.xlsx(emkegg, 
+             file = paste(save_dir, "/", sampleSet, "_DMR_", comparisonName, "_pathway_enrichment_promoter.xlsx", sep = ""), 
+             sheetName = "mKEGG", row.names = FALSE, append = TRUE), silent = TRUE)
+  try(emkegg <- as.data.frame(emkegg), silent = TRUE) 
+  try(cat("  Number of significantly enriched mKEGG terms:", length(emkegg[emkegg$qvalue<0.05,]$ID), "\n"), silent = TRUE)
+  
+  ## WP terms
+  try(ewp <- suppressWarnings(enrichWP(gene = gene, organism = "Homo sapiens", pvalueCutoff = 1, qvalueCutoff  = 1)), silent = TRUE)
+  try(ewp <- setReadable(ewp, OrgDb = org.Hs.eg.db, keyType="ENTREZID"), silent = TRUE)
+  
+  try(write.xlsx(ewp, 
+             file = paste(save_dir, "/", sampleSet, "_DMR_", comparisonName, "_pathway_enrichment_promoter.xlsx", sep = ""), 
+             sheetName = "WP", row.names = FALSE, append = TRUE), silent = TRUE)
+  try(ewp <- as.data.frame(ewp), silent = TRUE) 
+  try(cat("  Number of significantly enriched WP terms:", length(ewp[ewp$qvalue<0.05,]$ID), "\n"), silent = TRUE)
+  
+  ## Reactome terms
+  try(ereactome <- suppressWarnings(enrichPathway(gene=gene, pvalueCutoff = 1, qvalueCutoff  = 1, readable=TRUE)), silent = TRUE)
+  
+  try(write.xlsx(ereactome, 
+             file = paste(save_dir, "/", sampleSet, "_DMR_", comparisonName, "_pathway_enrichment_promoter.xlsx", sep = ""), 
+             sheetName = "Reactome", row.names = FALSE, append = TRUE), silent = TRUE)
+  try(ereactome <- as.data.frame(ereactome), silent = TRUE) 
+  try(cat("  Number of significantly enriched Reactome terms:", length(ereactome[ereactome$qvalue<0.05,]$ID), "\n"), silent = TRUE)
+  
+}
+
+```
+
+
+# Ctrl vs Combined (PD+PDD)
+```{r}
+
+summary_filepath <- file.path(tableDir, paste0(sampleSet, "_results_Ctrl_CombinedPD-PDD_with_2SVs.csv"))
+results <- fread(summary_filepath) %>% as.data.frame()
+
+ 
+```
+
+
+```{r}
+combp_input <- results %>%
+  transmute(
+    probe = Probe_ID,
+    chr = sub("chr", "", chr, ignore.case = TRUE),
+    start = as.integer(start),
+    end = as.integer(end),
+    p = P.Value 
+  ) %>%
+  filter(
+    chr %in% c(1:22, "X", "Y"),
+    !is.na(start),
+    !is.na(p)
+  ) %>%
+  arrange(factor(chr, levels = c(1:22, "X", "Y")), start)
+
+ENmix::combp(
+  data = combp_input,
+  dist.cutoff = 500,
+  seed = 0.001,
+  nCores = 1,         
+  verbose = FALSE,
+  mht_plot = FALSE,
+  region_plot = FALSE
+)
+
+dmr_results <- read.csv("resu_combp.csv")
+dmr_results <- dmr_results[,!(colnames(dmr_results) == c("probe"))]
+dmr_results$chr <- paste0("chr", dmr_results$chr)
+```
+
+
+
+```{r}
+# Annotate each comb-p region
+results_for_join <- results %>%
+  dplyr::select(Probe_ID, chr, start, end, effect_size)
+
+dmr_results <- dmr_results %>%
+  fuzzyjoin::genome_left_join(results_for_join, by = c("chr", "start", "end")) %>%
+  dplyr::rename(
+    chr = chr.x,
+    start = start.x,
+    end = end.x
+  ) %>%
+  group_by(across(all_of(colnames(dmr_results)))) %>%
+  summarise(
+    probe_ids = paste(unique(Probe_ID), collapse = ";"),
+    effect_size = mean(effect_size, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+
+  mutate(direction = ifelse(effect_size > 0, "hyper", "hypo")) %>%
+  arrange(fdr) 
+```
+
+```{r}
+
+anno_updated <- data.table::fread(file.path(inputDir, "annotations_for_R.csv")) %>%
+  as.data.frame() %>%
+  dplyr::rename(
+    chr = chr_feature,
+    start = start_feature,
+    end = end_feature
+  ) %>%
+  mutate(
+    chr = as.character(chr),
+    start = as.integer(start),
+    end = as.integer(end)
+  )
+
+```
+
+```{r}
+dmr_results <- fuzzyjoin::genome_left_join(
+    dmr_results,
+    anno_updated,
+    by = c("chr", "start", "end")
+  ) %>%
+  dplyr::rename(
+    chr = chr.x,
+    start = start.x,
+    end = end.x,
+    chr_feature = chr.y,
+    start_feature = start.y,
+    end_feature = end.y
+  ) %>%
+  mutate(
+    type = ifelse(is.na(type), "unspecified", type),
+  ) 
+
+dmr_enrichment <- dmr_results
+write.csv(dmr_results, 
+           file.path(tableDir, paste0(sampleSet, "_DMR_results_CtrlvsCombined_annotated_long.csv")), 
+           row.names = FALSE)
+
+dmr_results <- dmr_results %>%
+  group_by(chr, start, end, p, nprobe, fdr, sidak, effect_size, direction, probe_ids) %>%
+  summarise(
+    unique.position = paste(unique(position), collapse = "; "),
+    unique.type = paste(unique(type), collapse = "; "),
+    genesUniq = paste(unique(gene_name), collapse = "; "),
+    genesUniq_id = paste(unique(gene_id), collapse = "; "),
+    unique.transcript_id = paste(unique(transcript_id), collapse = "; "),
+    .groups = 'drop' 
+  ) %>%
+  dplyr::select(chr, start, end, p, nprobe, fdr, sidak, effect_size, direction, probe_ids, unique.position, unique.type, genesUniq, genesUniq_id, unique.transcript_id)
+
+# Save the results
+write.csv(dmr_results, 
+           file.path(tableDir, paste0(sampleSet, "_DMR_results_CtrlvsCombined_annotated.csv")), 
+           row.names = FALSE)
+#dmr_results <- read.csv(file.path(tableDir, paste0(sampleSet, "_DMR_results_CtrlvsCombined_annotated.csv")))
+```
+
+## Miami plot
+```{r}
+# Prepare Data for Plotting 
+probes_in_dmrs <- dmr_results %>%
+  pull(probe_ids) %>%
+  str_split(";") %>%
+  unlist() %>%
+  unique()
+
+# Calculate chromosome boundaries 
+chr_bounds <- results %>%
+  filter(!is.na(chr) & !is.na(start)) %>%
+  mutate(CHR_numeric = case_when(
+    toupper(chr) == "X" ~ 23, toupper(chr) == "Y" ~ 24,
+    TRUE ~ as.integer(stringr::str_remove(chr, "chr"))
+  )) %>%
+  filter(!is.na(CHR_numeric)) %>%
+  group_by(CHR_numeric) %>%
+  summarise(max_bp = max(start, na.rm = TRUE), .groups = "drop") %>%
+  mutate(bp_add = lag(cumsum(as.numeric(max_bp)), default = 0))
+
+# Create the final plot_data object
+plot_data <- results %>%
+  mutate(CHR_numeric = case_when(
+      toupper(chr) == "X" ~ 23, toupper(chr) == "Y" ~ 24,
+      TRUE ~ as.integer(stringr::str_remove(chr, "chr")))) %>%
+  inner_join(chr_bounds, by = "CHR_numeric") %>%
+  filter(!is.na(adj.P.Val) & !is.na(effect_size)) %>% 
+  mutate(
+    bp_cumulative = start + bp_add,
+    y_position = -log10(P.Value) * sign(effect_size), 
+    Highlight = ifelse(Probe_ID %in% probes_in_dmrs, "In DMR", "Not in DMR")
+  )
+label_data <- plot_data %>%
+  filter(adj.P.Val < 0.05 & !is.na(genesUniq))
+
+# Calculate the significance line and axis labels
+fdr_p_value_threshold <- max(plot_data$P.Value[plot_data$adj.P.Val < 0.05], na.rm = TRUE)
+y_intercept_fdr <- -log10(fdr_p_value_threshold)
+axis_labels <- plot_data %>% group_by(CHR_numeric) %>% summarize(center = mean(bp_cumulative), .groups = "drop")
+
+
+# Create the Miami Plot
+
+miami_plot <- ggplot(plot_data, aes(x = bp_cumulative, y = y_position)) +
+  
+  # Layer 1: Plot all background points (NOT in a DMR)
+  ggrastr::geom_point_rast(
+    data = filter(plot_data, Highlight == "Not in DMR"),
+    aes(color = as.factor(CHR_numeric %% 2)),
+    alpha = 0.7, size = 1, show.legend = FALSE,
+    raster.dpi = 600
+  ) +
+  scale_color_manual(values = c("0" = "skyblue", "1" = "grey60")) +
+  
+  # Layer 2: Plot the points that ARE in a DMR on top, in red
+  ggrastr::geom_point_rast(
+    data = filter(plot_data, Highlight == "In DMR"),
+    color = "red", 
+    size = 1.5,     
+    raster.dpi = 600
+  ) +
+
+  # Layer 3: Add the axis line and FDR significance lines
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.5) +
+  geom_hline(yintercept = c(y_intercept_fdr, -y_intercept_fdr), color = "black", linetype = "dashed") +
+  
+  geom_text_repel(
+    data = label_data,
+    aes(label = genesUniq),
+    size = 3.5,                     
+    color = "black",                
+    box.padding = 0.5,              
+    point.padding = 0.3,            
+    max.overlaps = 20,             
+    min.segment.length = 0,         
+    segment.color = 'grey50',       
+    segment.size = 0.3              
+  ) +
+  
+  # Layer 4: Add labels and theme
+  scale_x_continuous(label = axis_labels$CHR_numeric, breaks = axis_labels$center) +
+  scale_y_continuous(labels = abs) +
+  labs(x = "Chromosome", y = "-log10(p-value)") +
+  theme_classic() +
+  theme(panel.grid.major.x = element_blank())
+
+# Print the plot
+print(miami_plot)
+ggsave(filename=file.path(plotDir, "FrontalCortex_Combined_Miami_withregions.svg"), device="svg",width = 14, height = 7, units = "cm")
+
+```
+
+## Pathway enrichment
+
+
+```{r}
+pathway_enrichment(data=dmr_enrichment, sampleSet=sampleSet, comparisonName = "CtrlvsCombined", save_dir=tableDir)
+```
+
+
+
+
+# Ctrl vs PD
+```{r}
+
+summary_filepath <- file.path(tableDir, paste0(sampleSet, "_results_Ctrl_PD_with_0SVs.csv"))
+results <- fread(summary_filepath) %>% as.data.frame()
+
+ 
+```
+
+
+```{r}
+combp_input <- results %>%
+  transmute(
+    probe = Probe_ID,
+    chr = sub("chr", "", chr, ignore.case = TRUE),
+    start = as.integer(start),
+    end = as.integer(end),
+    p = P.Value 
+  ) %>%
+  filter(
+    chr %in% c(1:22, "X", "Y"),
+    !is.na(start),
+    !is.na(p)
+  ) %>%
+  arrange(factor(chr, levels = c(1:22, "X", "Y")), start)
+
+ENmix::combp(
+  data = combp_input,
+  dist.cutoff = 500,
+  seed = 0.001,
+  nCores = 1,         
+  verbose = FALSE,
+  mht_plot = FALSE,
+  region_plot = FALSE
+)
+
+dmr_results <- read.csv("resu_combp.csv")
+dmr_results <- dmr_results[,!(colnames(dmr_results) == c("probe"))]
+dmr_results$chr <- paste0("chr", dmr_results$chr)
+```
+
+
+
+```{r}
+# Annotate each comb-p region
+results_for_join <- results %>%
+  dplyr::select(Probe_ID, chr, start, end, effect_size)
+
+dmr_results <- dmr_results %>%
+  fuzzyjoin::genome_left_join(results_for_join, by = c("chr", "start", "end")) %>%
+  dplyr::rename(
+    chr = chr.x,
+    start = start.x,
+    end = end.x
+  ) %>%
+  group_by(across(all_of(colnames(dmr_results)))) %>%
+  summarise(
+    probe_ids = paste(unique(Probe_ID), collapse = ";"),
+    effect_size = mean(effect_size, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+
+  mutate(direction = ifelse(effect_size > 0, "hyper", "hypo")) %>%
+  arrange(fdr) 
+```
+
+```{r}
+
+anno_updated <- data.table::fread(file.path(inputDir, "annotations_for_R.csv")) %>%
+  as.data.frame() %>%
+  dplyr::rename(
+    chr = chr_feature,
+    start = start_feature,
+    end = end_feature
+  ) %>%
+  mutate(
+    chr = as.character(chr),
+    start = as.integer(start),
+    end = as.integer(end)
+  )
+```
+
+```{r}
+dmr_results <- fuzzyjoin::genome_left_join(
+    dmr_results,
+    anno_updated,
+    by = c("chr", "start", "end")
+  ) %>%
+  dplyr::rename(
+    chr = chr.x,
+    start = start.x,
+    end = end.x,
+    chr_feature = chr.y,
+    start_feature = start.y,
+    end_feature = end.y
+  ) %>%
+  mutate(
+    type = ifelse(is.na(type), "unspecified", type),
+  ) 
+
+dmr_enrichment <- dmr_results
+write.csv(dmr_results, 
+           file.path(tableDir, paste0(sampleSet, "_DMR_results_CtrlvsPD_annotated_long.csv")), 
+           row.names = FALSE)
+
+dmr_results <- dmr_results %>%
+  group_by(chr, start, end, p, nprobe, fdr, sidak, effect_size, direction, probe_ids) %>%
+  summarise(
+    unique.position = paste(unique(position), collapse = "; "),
+    unique.type = paste(unique(type), collapse = "; "),
+    genesUniq = paste(unique(gene_name), collapse = "; "),
+    genesUniq_id = paste(unique(gene_id), collapse = "; "),
+    unique.transcript_id = paste(unique(transcript_id), collapse = "; "),
+    .groups = 'drop' 
+  ) %>%
+  dplyr::select(chr, start, end, p, nprobe, fdr, sidak, effect_size, direction, probe_ids, unique.position, unique.type, genesUniq, genesUniq_id, unique.transcript_id)
+
+# Save the results
+write.csv(dmr_results, 
+           file.path(tableDir, paste0(sampleSet, "_DMR_results_CtrlvsPD_annotated.csv")), 
+           row.names = FALSE)
+
+```
+
+## Miami plot
+```{r}
+# Prepare Data for Plotting 
+probes_in_dmrs <- dmr_results %>%
+  pull(probe_ids) %>%
+  str_split(";") %>%
+  unlist() %>%
+  unique()
+
+# Calculate chromosome boundaries 
+chr_bounds <- results %>%
+  filter(!is.na(chr) & !is.na(start)) %>%
+  mutate(CHR_numeric = case_when(
+    toupper(chr) == "X" ~ 23, toupper(chr) == "Y" ~ 24,
+    TRUE ~ as.integer(stringr::str_remove(chr, "chr"))
+  )) %>%
+  filter(!is.na(CHR_numeric)) %>%
+  group_by(CHR_numeric) %>%
+  summarise(max_bp = max(start, na.rm = TRUE), .groups = "drop") %>%
+  mutate(bp_add = lag(cumsum(as.numeric(max_bp)), default = 0))
+
+# Create the final plot_data object
+plot_data <- results %>%
+  mutate(CHR_numeric = case_when(
+      toupper(chr) == "X" ~ 23, toupper(chr) == "Y" ~ 24,
+      TRUE ~ as.integer(stringr::str_remove(chr, "chr")))) %>%
+  inner_join(chr_bounds, by = "CHR_numeric") %>%
+  filter(!is.na(adj.P.Val) & !is.na(effect_size)) %>% 
+  mutate(
+    bp_cumulative = start + bp_add,
+    y_position = -log10(P.Value) * sign(effect_size), 
+    Highlight = ifelse(Probe_ID %in% probes_in_dmrs, "In DMR", "Not in DMR")
+  )
+label_data <- plot_data %>%
+  filter(adj.P.Val < 0.05 & !is.na(genesUniq))
+
+# Calculate the significance line and axis labels
+fdr_p_value_threshold <- max(plot_data$P.Value[plot_data$adj.P.Val < 0.05], na.rm = TRUE)
+y_intercept_fdr <- -log10(fdr_p_value_threshold)
+axis_labels <- plot_data %>% group_by(CHR_numeric) %>% summarize(center = mean(bp_cumulative), .groups = "drop")
+
+
+# Create the Miami Plot
+
+miami_plot <- ggplot(plot_data, aes(x = bp_cumulative, y = y_position)) +
+  
+  # Layer 1: Plot all background points (NOT in a DMR)
+  ggrastr::geom_point_rast(
+    data = filter(plot_data, Highlight == "Not in DMR"),
+    aes(color = as.factor(CHR_numeric %% 2)),
+    alpha = 0.7, size = 1, show.legend = FALSE,
+    raster.dpi = 600
+  ) +
+  scale_color_manual(values = c("0" = "skyblue", "1" = "grey60")) +
+  
+  # Layer 2: Plot the points that ARE in a DMR on top, in red
+  ggrastr::geom_point_rast(
+    data = filter(plot_data, Highlight == "In DMR"),
+    color = "red", 
+    size = 1.5,     
+    raster.dpi = 600
+  ) +
+
+  # Layer 3: Add the axis line and FDR significance lines
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.5) +
+  geom_hline(yintercept = c(y_intercept_fdr, -y_intercept_fdr), color = "black", linetype = "dashed") +
+  
+  geom_text_repel(
+    data = label_data,
+    aes(label = genesUniq),
+    size = 3.5,                     
+    color = "black",                
+    box.padding = 0.5,              
+    point.padding = 0.3,            
+    max.overlaps = 20,             
+    min.segment.length = 0,         
+    segment.color = 'grey50',       
+    segment.size = 0.3              
+  ) +
+  
+  # Layer 4: Add labels and theme
+  scale_x_continuous(label = axis_labels$CHR_numeric, breaks = axis_labels$center) +
+  scale_y_continuous(labels = abs) +
+  labs(x = "Chromosome", y = "-log10(p-value)") +
+  theme_classic() +
+  theme(panel.grid.major.x = element_blank())
+
+# Print the plot
+print(miami_plot)
+ggsave(filename=file.path(plotDir, "FrontalCortex_PD_Miami_withregions.svg"), device="svg",width = 14, height = 7, units = "cm")
+
+```
+
+## Pathway enrichment
+
+```{r}
+pathway_enrichment(data=dmr_enrichment, sampleSet=sampleSet, comparisonName = "CtrlvsPD", save_dir=tableDir)
+```
+
+
+
+# Ctrl vs PDD
+```{r}
+
+summary_filepath <- file.path(tableDir, paste0(sampleSet, "_results_Ctrl_PDD_with_2SVs.csv"))
+results <- fread(summary_filepath) %>% as.data.frame()
+
+ 
+```
+
+
+```{r}
+combp_input <- results %>%
+  transmute(
+    probe = Probe_ID,
+    chr = sub("chr", "", chr, ignore.case = TRUE),
+    start = as.integer(start),
+    end = as.integer(end),
+    p = P.Value 
+  ) %>%
+  filter(
+    chr %in% c(1:22, "X", "Y"),
+    !is.na(start),
+    !is.na(p)
+  ) %>%
+  arrange(factor(chr, levels = c(1:22, "X", "Y")), start)
+
+ENmix::combp(
+  data = combp_input,
+  dist.cutoff = 500,
+  seed = 0.001,
+  nCores = 1,         
+  verbose = FALSE,
+  mht_plot = FALSE,
+  region_plot = FALSE
+)
+
+dmr_results <- read.csv("resu_combp.csv")
+dmr_results <- dmr_results[,!(colnames(dmr_results) == c("probe"))]
+dmr_results$chr <- paste0("chr", dmr_results$chr)
+```
+
+
+
+```{r}
+# Annotate each comb-p region
+results_for_join <- results %>%
+  dplyr::select(Probe_ID, chr, start, end, effect_size)
+
+dmr_results <- dmr_results %>%
+  fuzzyjoin::genome_left_join(results_for_join, by = c("chr", "start", "end")) %>%
+  dplyr::rename(
+    chr = chr.x,
+    start = start.x,
+    end = end.x
+  ) %>%
+  group_by(across(all_of(colnames(dmr_results)))) %>%
+  summarise(
+    probe_ids = paste(unique(Probe_ID), collapse = ";"),
+    effect_size = mean(effect_size, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+
+  mutate(direction = ifelse(effect_size > 0, "hyper", "hypo")) %>%
+  arrange(fdr) 
+```
+
+```{r}
+
+anno_updated <- data.table::fread(file.path(inputDir, "annotations_for_R.csv")) %>%
+  as.data.frame() %>%
+  dplyr::rename(
+    chr = chr_feature,
+    start = start_feature,
+    end = end_feature
+  ) %>%
+  mutate(
+    chr = as.character(chr),
+    start = as.integer(start),
+    end = as.integer(end)
+  )
+```
+
+```{r}
+dmr_results <- fuzzyjoin::genome_left_join(
+    dmr_results,
+    anno_updated,
+    by = c("chr", "start", "end")
+  ) %>%
+  dplyr::rename(
+    chr = chr.x,
+    start = start.x,
+    end = end.x,
+    chr_feature = chr.y,
+    start_feature = start.y,
+    end_feature = end.y
+  ) %>%
+  mutate(
+    type = ifelse(is.na(type), "unspecified", type),
+  ) 
+
+dmr_enrichment <- dmr_results
+write.csv(dmr_results, 
+           file.path(tableDir, paste0(sampleSet, "_DMR_results_CtrlvsPDD_annotated_long.csv")), 
+           row.names = FALSE)
+
+dmr_results <- dmr_results %>%
+  group_by(chr, start, end, p, nprobe, fdr, sidak, effect_size, direction, probe_ids) %>%
+  summarise(
+    unique.position = paste(unique(position), collapse = "; "),
+    unique.type = paste(unique(type), collapse = "; "),
+    genesUniq = paste(unique(gene_name), collapse = "; "),
+    genesUniq_id = paste(unique(gene_id), collapse = "; "),
+    unique.transcript_id = paste(unique(transcript_id), collapse = "; "),
+    .groups = 'drop' 
+  ) %>%
+  dplyr::select(chr, start, end, p, nprobe, fdr, sidak, effect_size, direction, probe_ids, unique.position, unique.type, genesUniq, genesUniq_id, unique.transcript_id)
+
+# Save the results
+write.csv(dmr_results, 
+           file.path(tableDir, paste0(sampleSet, "_DMR_results_CtrlvsPDD_annotated.csv")), 
+           row.names = FALSE)
+
+
+```
+
+## Miami plot
+```{r}
+# Prepare Data for Plotting 
+probes_in_dmrs <- dmr_results %>%
+  pull(probe_ids) %>%
+  str_split(";") %>%
+  unlist() %>%
+  unique()
+
+# Calculate chromosome boundaries 
+chr_bounds <- results %>%
+  filter(!is.na(chr) & !is.na(start)) %>%
+  mutate(CHR_numeric = case_when(
+    toupper(chr) == "X" ~ 23, toupper(chr) == "Y" ~ 24,
+    TRUE ~ as.integer(stringr::str_remove(chr, "chr"))
+  )) %>%
+  filter(!is.na(CHR_numeric)) %>%
+  group_by(CHR_numeric) %>%
+  summarise(max_bp = max(start, na.rm = TRUE), .groups = "drop") %>%
+  mutate(bp_add = lag(cumsum(as.numeric(max_bp)), default = 0))
+
+# Create the final plot_data object
+plot_data <- results %>%
+  mutate(CHR_numeric = case_when(
+      toupper(chr) == "X" ~ 23, toupper(chr) == "Y" ~ 24,
+      TRUE ~ as.integer(stringr::str_remove(chr, "chr")))) %>%
+  inner_join(chr_bounds, by = "CHR_numeric") %>%
+  filter(!is.na(adj.P.Val) & !is.na(effect_size)) %>% 
+  mutate(
+    bp_cumulative = start + bp_add,
+    y_position = -log10(P.Value) * sign(effect_size), 
+    Highlight = ifelse(Probe_ID %in% probes_in_dmrs, "In DMR", "Not in DMR")
+  )
+label_data <- plot_data %>%
+  filter(adj.P.Val < 0.05 & !is.na(genesUniq))
+
+# Calculate the significance line and axis labels
+fdr_p_value_threshold <- max(plot_data$P.Value[plot_data$adj.P.Val < 0.05], na.rm = TRUE)
+y_intercept_fdr <- -log10(fdr_p_value_threshold)
+axis_labels <- plot_data %>% group_by(CHR_numeric) %>% summarize(center = mean(bp_cumulative), .groups = "drop")
+
+
+# Create the Miami Plot
+
+miami_plot <- ggplot(plot_data, aes(x = bp_cumulative, y = y_position)) +
+  
+  # Layer 1: Plot all background points (NOT in a DMR)
+  ggrastr::geom_point_rast(
+    data = filter(plot_data, Highlight == "Not in DMR"),
+    aes(color = as.factor(CHR_numeric %% 2)),
+    alpha = 0.7, size = 1, show.legend = FALSE,
+    raster.dpi = 600
+  ) +
+  scale_color_manual(values = c("0" = "skyblue", "1" = "grey60")) +
+  
+  # Layer 2: Plot the points that ARE in a DMR on top, in red
+  ggrastr::geom_point_rast(
+    data = filter(plot_data, Highlight == "In DMR"),
+    color = "red", 
+    size = 1.5,     
+    raster.dpi = 600
+  ) +
+
+  # Layer 3: Add the axis line and FDR significance lines
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.5) +
+  geom_hline(yintercept = c(y_intercept_fdr, -y_intercept_fdr), color = "black", linetype = "dashed") +
+  
+  geom_text_repel(
+    data = label_data,
+    aes(label = genesUniq),
+    size = 3.5,                     
+    color = "black",                
+    box.padding = 0.5,              
+    point.padding = 0.3,            
+    max.overlaps = 20,             
+    min.segment.length = 0,         
+    segment.color = 'grey50',       
+    segment.size = 0.3              
+  ) +
+  
+  # Layer 4: Add labels and theme
+  scale_x_continuous(label = axis_labels$CHR_numeric, breaks = axis_labels$center) +
+  scale_y_continuous(labels = abs) +
+  labs(x = "Chromosome", y = "-log10(p-value)") +
+  theme_classic() +
+  theme(panel.grid.major.x = element_blank())
+
+# Print the plot
+print(miami_plot)
+ggsave(filename=file.path(plotDir, "FrontalCortex_PDD_Miami_withregions.svg"), device="svg",width = 14, height = 7, units = "cm")
+
+```
+
+## Pathway enrichment
+
+
+```{r}
+pathway_enrichment(data=dmr_enrichment, sampleSet=sampleSet, comparisonName = "CtrlvsPDD", save_dir=tableDir)
+```
+

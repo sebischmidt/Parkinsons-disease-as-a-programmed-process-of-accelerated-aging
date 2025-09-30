@@ -1,0 +1,445 @@
+---
+title: "Meta-analysis methylation data - whole blood"
+author: "Sebastian Schmidt"
+date: "2025-06-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+knitr::opts_knit$set(root.dir = "F:/MetaAnalysisMethylation")
+
+library(BiocParallel)
+library(ggplot2)
+library(dplyr)
+library(parallel)
+library(data.table)
+library(tibble)
+library(missMethyl)
+library(msigdbr)
+library(clusterProfiler)
+library(enrichplot)
+library(DOSE)
+library(meta)
+library(fdrtool)
+library(ggrastr)
+library(ggrepel)
+library(tidyr)
+library(stringr)
+library(ggnewscale)
+library(fuzzyjoin)
+```
+
+```{r}
+sampleSets <- c('PPMI_120', 'PPMI_140', 'GSE145361', 'GSE111629')
+
+baseDir <- "F:/MetaAnalysisMethylation"
+outputDir <- file.path(baseDir, "output")
+tableDir <- file.path(outputDir, "tables")
+plotDir <- file.path(outputDir, "figures")
+```
+
+
+```{r}
+inputDir <- file.path(baseDir, "input")
+dir.create(tableDir, showWarnings = FALSE, recursive = TRUE)
+dir.create(plotDir, showWarnings = FALSE, recursive = TRUE)
+```
+
+
+# Load Data Sets
+```{r}
+allPD <- 0
+allCtrl <- 0
+studyStats <- list()
+studyBetas <- list()
+studyStats_lists <- list()
+for (sample in sampleSets) {
+  cat("Processing data set: ",sample, "\n")
+  # Load files
+  summary_filepath <- file.path(outputDir, paste0(sample, "_Ctrl_PD_final_results.rds"))
+  pheno_filepath <- file.path(tableDir, paste0(sample, "_sample_phenotype.csv"))
+  beta_filepath <- file.path(tableDir, paste0(sample, "_beta_values_corrected.tsv.gz"))
+
+  summaries <- readRDS(summary_filepath)
+
+  pheno <- fread(pheno_filepath) %>% as.data.frame()
+  if ("IDarray" %in% colnames(pheno)) {
+    cat("  Found 'IDarray' column. Overwriting 'ID' and removing 'IDarray'. \n")
+    pheno <- pheno %>%
+      mutate(ID = IDarray) %>%    
+      select(-IDarray)            
+  }
+  if (!("ID" %in% colnames(pheno))) {
+    pheno$ID <- paste(pheno$SENTRIXID, pheno$POSITION, sep="_")
+    cat("  No 'ID' column found. Adding...\n")
+  }
+  
+  bVals <- fread(beta_filepath, check.names = FALSE) %>% as.data.frame()
+  bVals <- column_to_rownames(bVals, var = "V1")
+
+  
+  # Subset pheno
+  pheno <- pheno[pheno$ID %in% intersect(pheno$ID, colnames(bVals)), ]
+  pheno <- pheno[match(colnames(bVals), pheno$ID), ]
+  
+  # Add SE and n to summary stats
+  samples_ctrl <- pheno$ID[pheno$Condition == "Control"]
+  samples_pd <- pheno$ID[pheno$Condition == "Parkinson's disease"]
+  
+  N_ctrl <- length(samples_ctrl)
+  N_PD <- length(samples_pd)
+  
+  # All samples in study
+  allCtrl <- (allCtrl+N_ctrl)
+  allPD <- (allPD+N_PD)
+    
+  # Store betas
+  studyBetas[[sample]] <- bVals
+  
+  cat("  Found n Control samples: ", N_ctrl, "\n")
+  cat("  Found n Parkinson's disease samples: ", N_PD, "\n")
+  
+  for (sv_name in names(summaries)) {
+    summary_stats <- summaries[[sv_name]]
+
+    summary_stats <- summary_stats %>%
+      mutate(
+        SE = abs(logFC / t),
+        N_ctrl = N_ctrl,
+        N_PD = N_PD
+      )
+
+    summaries[[sv_name]] <- summary_stats
+  }
+
+  # Save updated stats
+  studyStats_lists[[sample]] <- summaries
+
+}
+ 
+```
+
+```{r}
+cat("Found in total n samples: \n  Control: ", allCtrl, "\n  Parkinson's disease: ", allPD) 
+```
+
+```{r}
+# Choose results with reasonable number of SVs used for correction
+optimal_sv_counts <- list(
+  "GSE111629" = 1,
+  "GSE145361" = 5,  
+  "PPMI_120"  = 0,
+  "PPMI_140"  = 0
+)
+
+for (sample in sampleSets) {
+  sv_choice <- optimal_sv_counts[[sample]]
+  sv_key <- paste0("SVs_", sv_choice)
+  
+  topTables_list <- studyStats_lists[[sample]]
+
+  studyStats[[sample]] <- topTables_list[[sv_key]]
+}
+```
+
+
+# Run Meta-Analysis
+
+```{r}
+# Harmonize and create matrices
+common_probes <- Reduce(intersect, lapply(studyStats, function(df) df$Probe_ID))
+
+create_matrix_from_list <- function(data_list, col_name, common_probes_vec) {
+  mat <- sapply(data_list, function(df) df[[col_name]][match(common_probes_vec, df$Probe_ID)])
+  rownames(mat) <- common_probes_vec
+  return(mat)
+}
+
+# Create matrices for all necessary data
+effects_matrix   <- create_matrix_from_list(studyStats, "logFC", common_probes)
+se_matrix        <- create_matrix_from_list(studyStats, "SE", common_probes)
+mean_ctrl_matrix <- create_matrix_from_list(studyStats, "mean_Control", common_probes)
+mean_pd_matrix   <- create_matrix_from_list(studyStats, "mean_Case", common_probes)
+n_ctrl_matrix    <- create_matrix_from_list(studyStats, "N_ctrl", common_probes)
+n_pd_matrix      <- create_matrix_from_list(studyStats, "N_PD", common_probes)
+
+
+```
+
+
+```{r}
+# Perform Meta-Analysis (Probe by Probe)
+
+param <- SnowParam(workers = 16)  
+
+# Function to apply to each probe
+meta_per_probe <- function(i) {
+  TE_probe <- effects_matrix[i, ]
+  seTE_probe <- se_matrix[i, ]
+  
+  if (any(is.na(TE_probe)) || any(is.na(seTE_probe))) return(rep(NA, 8))
+  
+  meta_res <- tryCatch({
+    suppressWarnings(suppressMessages(
+      metagen(
+        TE = TE_probe,
+        seTE = seTE_probe,
+        sm = "MD",
+        common = TRUE,
+        random = TRUE,
+        warn = FALSE
+      )
+    ))
+  }, error = function(e) return(NULL))
+  
+  if (is.null(meta_res)) return(rep(NA, 8))
+  
+  c(k = meta_res$k,
+    logFC_fixed = meta_res$TE.fixed, se_fixed = meta_res$seTE.fixed, pval_fixed = meta_res$pval.fixed,
+    logFC_random = meta_res$TE.random, se_random = meta_res$seTE.random, pval_random = meta_res$pval.random,
+    I2 = meta_res$I2)
+}
+
+results_list <- bplapply(seq_len(nrow(effects_matrix)), meta_per_probe, BPPARAM = param)
+meta_results <- do.call(rbind, results_list)
+rownames(meta_results) <- rownames(effects_matrix)
+meta_results <- as.data.frame(meta_results)
+meta_results$Probe_ID <- rownames(meta_results)
+#meta_results_backup <- meta_results
+```
+
+```{r}
+#  Add Weighted Mean Betas 
+meta_results$mean_ctrl <- rowSums(mean_ctrl_matrix * n_ctrl_matrix, na.rm = TRUE) / rowSums(n_ctrl_matrix, na.rm = TRUE)
+meta_results$mean_pd <- rowSums(mean_pd_matrix * n_pd_matrix, na.rm = TRUE) / rowSums(n_pd_matrix, na.rm = TRUE)
+meta_results$effect_size <- meta_results$mean_ctrl-meta_results$mean_pd
+```
+
+```{r}
+# Calculate FDR
+meta_results <- meta_results[!is.na(meta_results$pval_fixed), ]
+meta_results <- meta_results[order(meta_results$pval_fixed), ]
+meta_results$"p.adj_fixed" <- fdrtool(meta_results$pval_fixed, 
+                      statistic = "pvalue", 
+                      plot = FALSE,
+                      verbose = FALSE)$qval
+meta_results[meta_results$p.adj_fixed < 0.05,]
+
+meta_results$"p.adj_random" <- fdrtool(meta_results$pval_random, 
+                      statistic = "pvalue", 
+                      plot = FALSE,
+                      verbose = FALSE)$qval
+meta_results[meta_results$p.adj_random < 0.05,]
+```
+
+```{r}
+anno <- read.csv(file.path(tableDir, "PPMI_140_probe_annotation_GRCh38.csv"))
+anno <- anno[, colnames(anno) %in% c("Probe_ID","chr", "start", "end", "genesUniq", "geneNames", "transcriptTypes", "transcriptIDs")]
+# Annotate
+results <- meta_results %>%
+  left_join(anno, by = "Probe_ID")
+
+
+
+```
+
+```{r}
+# Save final results
+write.csv(results,
+          file.path(tableDir, "Blood_MetaAnalysis_Final_Results.csv"),
+          row.names = FALSE)
+```
+
+
+
+# Miami Plot
+
+```{r}
+# Miami plot
+
+
+chr_bounds <- results %>%
+  filter(!is.na(chr) & !is.na(start)) %>%
+  mutate(CHR_numeric = case_when(
+    toupper(chr) == "chrX" ~ 23, toupper(chr) == "chrY" ~ 24,
+    TRUE ~ as.integer(stringr::str_remove(chr, "chr"))
+  )) %>%
+  filter(!is.na(CHR_numeric)) %>%
+  group_by(CHR_numeric) %>%
+  summarise(max_bp = max(start, na.rm = TRUE), .groups = "drop") %>%
+  mutate(bp_add = lag(cumsum(as.numeric(max_bp)), default = 0))
+
+
+plot_data <- results %>%
+  mutate(CHR_numeric = case_when(
+      toupper(chr) == "chrX" ~ 23, toupper(chr) == "chrY" ~ 24,
+      TRUE ~ as.integer(stringr::str_remove(chr, "chr")))) %>%
+  inner_join(chr_bounds, by = "CHR_numeric") %>% 
+  mutate(
+    bp_cumulative = start + bp_add, 
+    y_position = -log10(pval_fixed) * sign(effect_size)
+  )
+
+label_data <- plot_data %>%
+  filter(p.adj_fixed < 0.05 & !is.na(genesUniq))
+
+fdr_line_y_intercept <- -log10(max(plot_data$pval_fixed[plot_data$p.adj_fixed < 0.05], na.rm = TRUE))
+axis_labels <- plot_data %>% group_by(CHR_numeric) %>% summarize(center = mean(bp_cumulative), .groups = "drop")
+
+
+miami_plot <- ggplot(plot_data, aes(x = bp_cumulative, y = y_position, color = effect_size > 0)) +
+  geom_point_rast(aes(color = as.factor(CHR_numeric %% 2)), 
+                  alpha = 0.7, size = 1, show.legend = FALSE, 
+                  raster.dpi = 600) +
+  scale_color_manual(values = c("0" = "skyblue", "1" = "grey60")) + 
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.5) +
+  geom_hline(yintercept = c(fdr_line_y_intercept, -fdr_line_y_intercept), color = "black", linetype = "dashed") +
+  scale_x_continuous(label = axis_labels$CHR_numeric, breaks = axis_labels$center) +
+  scale_y_continuous(labels = abs) +
+  labs(x = "Chromosome", y = "-log10(p-value)") +
+  geom_text_repel(
+    data = label_data,
+    aes(label = genesUniq),
+    size = 3.5,                     
+    color = "black",                
+    box.padding = 0.5,              
+    point.padding = 0.3,            
+    max.overlaps = 20,             
+    min.segment.length = 0,         
+    segment.color = 'grey50',       
+    segment.size = 0.3              
+  ) +
+  theme_classic() +
+  theme(panel.grid.major.x = element_blank())
+
+print(miami_plot)
+ggsave(filename=file.path(plotDir, "Blood_MetaAnalysis_Miami.svg"), device="svg",width = 14, height = 7, units = "cm")
+```
+
+# Pathway enrichment analysis
+
+```{r}
+sig_probes <- results$Probe_ID[results$p.adj_fixed < 0.05]
+all_probes <- results$Probe_ID
+```
+
+```{r}
+# Gene Ontology
+gos <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "GO:BP")
+gos_bp <- split(x = gos$entrez_gene, f = gos$gs_name)
+
+gos <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "GO:CC")
+gos_cc <- split(x = gos$entrez_gene, f = gos$gs_name)
+
+gos <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "GO:MF")
+gos_mf <- split(x = gos$entrez_gene, f = gos$gs_name)
+
+# KEGG Legacy
+keggs_legacy <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG_LEGACY")
+keggs_legacy <- split(x = keggs_legacy$entrez_gene, f = keggs_legacy$gs_name)
+
+# KEGG Medicus
+keggs_med <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG_MEDICUS")
+keggs_med <- split(x = keggs_med$entrez_gene, f = keggs_med$gs_name)
+
+# Reactome
+reactomes <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:REACTOME")
+reactomes <- split(x = reactomes$entrez_gene, f = reactomes$gs_name)
+
+# WikiPathways
+wikipathways <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:WIKIPATHWAYS")
+wikipathways <- split(x = wikipathways$entrez_gene, f = wikipathways$gs_name)
+```
+
+
+```{r}
+# Run Enrichment Analysis using gsameth() 
+
+eGO_bp <- gsameth(
+  sig.cpg = sig_probes,
+  all.cpg = all_probes,
+  collection = gos_bp,
+  array.type = "EPIC",
+  plot.bias = FALSE,
+  prior.prob = TRUE
+)
+eGO_bp <- eGO_bp[order(eGO_bp$FDR), ]
+cat("Found", length(eGO_bp[eGO_bp$FDR<0.05,]$FDR), "enriched GO BP terms.\n")
+write.csv(eGO_bp, file.path(tableDir, "Blood_Enrichment_GObp.csv"))
+
+eGO_cc <- gsameth(
+  sig.cpg = sig_probes,
+  all.cpg = all_probes,
+  collection = gos_cc,
+  array.type = "EPIC",
+  plot.bias = FALSE,
+  prior.prob = TRUE
+)
+eGO_cc <- eGO_cc[order(eGO_cc$FDR), ]
+cat("Found", length(eGO_cc[eGO_cc$FDR<0.05,]$FDR), "enriched GO CC terms.\n")
+write.csv(eGO_cc, file.path(tableDir, "Blood_Enrichment_GOcc.csv"))
+
+eGO_mf <- gsameth(
+  sig.cpg = sig_probes,
+  all.cpg = all_probes,
+  collection = gos_mf,
+  array.type = "EPIC",
+  plot.bias = FALSE,
+  prior.prob = TRUE
+)
+eGO_mf <- eGO_mf[order(eGO_mf$FDR), ]
+cat("Found", length(eGO_mf[eGO_mf$FDR<0.05,]$FDR), "enriched GO MF terms.\n")
+write.csv(eGO_mf, file.path(tableDir, "Blood_Enrichment_GOmf.csv"))
+
+eReactome <- gsameth(
+  sig.cpg = sig_probes,
+  all.cpg = all_probes,
+  collection = reactomes,
+  array.type = "EPIC",
+  plot.bias = FALSE,
+  prior.prob = TRUE
+)
+eReactome <- eReactome[order(eReactome$FDR), ]
+cat("Found", length(eReactome[eReactome$FDR<0.05,]$FDR), "enriched Reactome terms.\n")
+write.csv(eReactome, file.path(tableDir, "Blood_Enrichment_Reactome.csv"))
+
+eKEGG_legacy <- gsameth(
+  sig.cpg = sig_probes,
+  all.cpg = all_probes,
+  collection = keggs_legacy,
+  array.type = "EPIC",
+  plot.bias = FALSE,
+  prior.prob = TRUE
+)
+eKEGG_legacy <- eKEGG_legacy[order(eKEGG_legacy$FDR), ]
+cat("Found", length(eKEGG_legacy[eKEGG_legacy$FDR<0.05,]$FDR), "enriched KEGG_legacy terms.\n")
+write.csv(eKEGG_legacy, file.path(tableDir, "Blood_Enrichment_KEGG_legacy.csv"))
+
+eKEGG_med <- gsameth(
+  sig.cpg = sig_probes,
+  all.cpg = all_probes,
+  collection = keggs_med,
+  array.type = "EPIC",
+  plot.bias = FALSE,
+  prior.prob = TRUE
+)
+eKEGG_med <- eKEGG_med[order(eKEGG_med$FDR), ]
+cat("Found", length(eKEGG_med[eKEGG_med$FDR<0.05,]$FDR), "enriched KEGG_med terms.\n")
+write.csv(eKEGG_med, file.path(tableDir, "Blood_Enrichment_KEGG_med.csv"))
+
+eWP <- gsameth(
+  sig.cpg = sig_probes,
+  all.cpg = all_probes,
+  collection = wikipathways,
+  array.type = "EPIC",
+  plot.bias = FALSE,
+  prior.prob = TRUE
+)
+eWP <- eWP[order(eWP$FDR), ]
+cat("Found", length(eWP[eWP$FDR<0.05,]$FDR), "enriched WP terms.\n")
+write.csv(eWP, file.path(tableDir, "Blood_Enrichment_WP.csv"))
+
+
+```
+
